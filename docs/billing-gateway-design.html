@@ -1603,6 +1603,369 @@ T0    客户手工抄录 + import，服务不中断
 </tr>
 </tbody>
 </table>
+
+<hr />
+
+<h1 id="appendix-f">附录 F：完全离线模式下的扣减正确性保障</h1>
+
+<p>本附录针对附录 E 描述的<strong>纯许可文件模式</strong>，回答一个问题：<strong>在没有任何远端协调者的情况下，本地如何保证扣减是正确的、不丢、不重、不被绕过、断电不坏账、回滚能察觉</strong>。</p>
+
+<h2 id="f1">F.1 局部 ACID 与可接受的妥协</h2>
+
+<table>
+<thead><tr><th>性质</th><th>必须保证</th><th>实现手段</th></tr></thead>
+<tbody>
+<tr><td>原子性 (A)</td><td>一次扣减要么完全生效要么完全无效，不允许"扣了点数但未写日志"或反之</td><td>串行写入器 + WAL 先于状态 + fsync</td></tr>
+<tr><td>一致性 (C)</td><td>任意时刻 <code>available = Σlicense - Σcommitted - Σheld</code> 恒等</td><td>状态从 WAL 派生，启动时回放重建</td></tr>
+<tr><td>隔离性 (I)</td><td>并发请求看到的余额相互一致，不能"双花"许可</td><td>单写者 actor + 内存余额受写者独占</td></tr>
+<tr><td>持久性 (D)</td><td>对客户端返回成功的扣减，必须能在重启 / 掉电后保留</td><td>WAL 段 <code>O_APPEND|O_DSYNC</code> + 显式 fsync</td></tr>
+<tr><td>反回滚</td><td>VM 快照回滚必须被察觉</td><td>TPM NV 单调计数器 + 心跳消耗</td></tr>
+<tr><td>反篡改</td><td>root 用户也无法静默删/改记录</td><td><code>chattr +a</code> + Merkle 链 + TPM 签名</td></tr>
+<tr><td>幂等性</td><td>业务侧重试不导致重复扣费</td><td>request_id 持久索引</td></tr>
+</tbody>
+</table>
+
+<p>不保证的：跨节点强一致（见 F.8 HA 章），毫秒级时钟正确（仅保证单调），TPM 故障后的高安全等级（降级到文件计数器 + 告警）。</p>
+
+<h2 id="f2">F.2 状态模型 —— "WAL 即真理，余额只是缓存"</h2>
+
+<p>本地<strong>不</strong>把"剩余点数"当作权威状态。权威状态只有两类：</p>
+
+<ol>
+<li><strong>已装载的许可集合</strong> —— 不变量，由签名校验保护</li>
+<li><strong>WAL 上的扣减记录链</strong> —— 仅追加，由哈希链 + TPM 计数器保护</li>
+</ol>
+
+<p>"可用余额"是一个<strong>派生量</strong>：</p>
+
+<pre><code>available_points(t) =   Σ license.total_points (license in active_stack)
+                      - Σ record.points         (record in WAL, state=COMMITTED)
+                      - Σ hold.points           (hold in active, not yet finalized)
+                      - Σ heartbeat.points      (heartbeat burn 累计)
+</code></pre>
+
+<p>意味着：<strong>quota DB 损坏永远不会丢钱</strong>——重启时从 WAL 全量回放就能精确重建余额。这是离线模式可信的根基。</p>
+
+<h2 id="f3">F.3 串行写入器 —— 用单线程换确定性</h2>
+
+<pre><code>             ┌─────────── Business goroutines (并发) ───────────┐
+             │   hold(req1)    commit(req2)    cancel(req3) ... │
+             └──────────────────────┬────────────────────────────┘
+                                    │ 通过 channel 投递 Op
+                                    ▼
+                       ┌────────────────────────┐
+                       │   单写入器 goroutine   │   ← 严格串行
+                       │   (Quota Writer Actor) │
+                       └─────┬──────────┬───────┘
+                             │          │
+                       (1) 内存余额   (2) WAL.append + fsync
+                       (3) TPM NV    (4) reply channel
+</code></pre>
+
+<p>选择 actor 模型而不是锁/事务的理由：</p>
+
+<ul>
+<li>写路径 TPS 上限由"TPM 增量 + fsync"决定，约 100~500 ops/s，单线程足够；</li>
+<li>读路径（查余额）走原子快照，并发无阻塞；</li>
+<li>没有锁就没有死锁，没有事务就没有 ABA / 幻读；</li>
+<li>所有持久化顺序由单一队列决定，崩溃恢复的因果顺序天然清晰。</li>
+</ul>
+
+<h2 id="f4">F.4 完整扣减算法（含 TPM 锚定）</h2>
+
+<p>下面是写入器处理一次 <code>commit(request_id, items)</code> 的精确步骤。每一步的失败处理在右列。</p>
+
+<pre><code>function handle_commit(req):
+  ┌─── 阶段 1：纯校验，不改任何状态 ───┐
+  1. lookup idempotency_index[req.request_id]
+        if exists → 直接返回缓存结果（幂等命中）
+  2. 选择 active_license：栈中第一张未过期且 valid_from ≤ now 的
+        if none → 返回 LICENSE_EXHAUSTED
+  3. points = price(items) via active_license.pricing_table
+  4. if available_points &lt; points
+        if 允许跨许可拼接 → 拆分到下一张许可
+        else → 返回 INSUFFICIENT_POINTS
+  5. clock_check()：see F.6，异常则返回 CLOCK_ANOMALY
+
+  ┌─── 阶段 2：硬件锚定 ───┐
+  6. tpm_counter = TPM_NV_Increment(slot_usage)   // ~30~80ms
+        if 失败：见 F.9 降级表
+
+  ┌─── 阶段 3：持久化（关键路径，顺序不可变）───┐
+  7. record = {
+       seq         : last_seq + 1,
+       request_id  : req.request_id,
+       license_id  : active_license.id,
+       items       : items,
+       points      : points,
+       tpm_counter : tpm_counter,
+       wall_clock  : now,
+       prev_hash   : last_hash,
+     }
+  8. record.this_hash = SHA256(canonical(record))
+  9. encoded = CBOR(record)              // 紧凑、确定序列化
+ 10. wal_writer.append(encoded)          // open with O_APPEND|O_DSYNC
+ 11. fsync(wal_fd)                       // ← 真正的耐久性界限在这里
+        if fsync 失败 → panic（不能假装成功了）
+
+  ┌─── 阶段 4：内存生效（已耐久，安全更新）───┐
+ 12. balance.used += points
+ 13. last_seq = record.seq
+ 14. last_hash = record.this_hash
+ 15. idempotency_index[req.request_id] = {points, seq}   // 写回 + 异步落盘
+ 16. 通过 reply channel 返回成功
+
+  ┌─── 阶段 5：异步副作用（不影响正确性）───┐
+ 17. metric.observe(points)
+ 18. 周期性 checkpoint：把 balance / last_seq 写到 quota.db
+ 19. 每日 00:00：合 Daily Anchor + TPM 签名（见附录 B）
+</code></pre>
+
+<p><strong>核心顺序保证</strong>：TPM 增量 → WAL 写 → fsync → 内存生效。任何阶段崩溃都可由 F.5 的恢复算法收敛到唯一一致状态。</p>
+
+<h2 id="f5">F.5 崩溃恢复 —— 把"中间态"统一到"已扣或未扣"</h2>
+
+<p>由于 TPM 增量先于 WAL 写、WAL 写先于内存生效，重启时可能出现三种"中间态"：</p>
+
+<table>
+<thead><tr><th>异常</th><th>启动时表现</th><th>恢复动作</th></tr></thead>
+<tbody>
+<tr><td>掉电在第 6 步之后、第 10 步之前</td><td>TPM 计数器已增，WAL 未增</td><td>视为 <strong>幽灵增量</strong>：在 WAL 写入一条 <code>phantom_increment</code> 记录补齐，不扣点数；触发告警；下次客户端重试用同 request_id 仍会扣费（idempotency 未命中）</td></tr>
+<tr><td>掉电在第 10 步之后、fsync 返回前</td><td>记录可能写了一部分（kernel page cache 未落盘）</td><td>启动时按 CBOR 边界扫描，遇到不完整尾记录 truncate；下一条 prev_hash 校验天然把不完整记录排除</td></tr>
+<tr><td>掉电在 fsync 之后、第 12 步之前</td><td>WAL 完整、内存未更新</td><td>WAL 回放重建内存余额；客户端若重试用同 request_id → 幂等命中返回已扣结果</td></tr>
+</tbody>
+</table>
+
+<p><strong>完整恢复算法</strong>：</p>
+
+<pre><code>function recover():
+  1. 加载所有有效 license 文件，验证签名
+  2. tpm_counter_now = TPM_NV_Read(slot_usage)
+  3. 打开 WAL，从最后一个 Daily Anchor 开始顺序扫描
+        - 校验每条 record 的 prev_hash / this_hash
+        - 遇到 CBOR 解析失败的尾记录 → truncate 到上一条
+  4. last_record = WAL 最末一条有效记录
+  5. if last_record.tpm_counter &gt; tpm_counter_now:
+        // 严重：意味着 WAL 包含了"未来"的扣费 → 一定是回滚攻击
+        ENTER_FROZEN_STATE("tpm_rollback_detected")
+        return
+  6. if last_record.tpm_counter &lt; tpm_counter_now - tolerance:
+        // 存在幽灵增量，补齐 phantom 记录
+        append phantom_increment records
+        告警
+  7. 重建内存余额：available = Σlicense - Σcommitted - Σheartbeat
+  8. 加载 idempotency_index 持久化分片
+  9. 启动 heartbeat goroutine（见 F.6）
+ 10. ready
+</code></pre>
+
+<p>恢复期间<strong>拒绝服务新请求</strong>，对外返回 <code>503 Recovering</code>，避免在不一致状态下扣费。</p>
+
+<h2 id="f6">F.6 心跳与时钟保护 —— 让"时间"也变得不可篡改</h2>
+
+<p>纯离线模式没有 NTP / 远端时间源，必须本地构造"时间不可回退"的证据。</p>
+
+<h3>F.6.1 心跳消耗（Heartbeat Burn）</h3>
+
+<pre><code>独立 goroutine，每 60s 触发一次：
+  1. 通过同一写入器队列投递一条 HeartbeatOp
+  2. 写入器把它当作一笔特殊的扣费处理（金额 0.01 点）
+  3. 增量 TPM 的 slot_heartbeat（与扣费 slot 分开统计）
+  4. 落 WAL + fsync
+</code></pre>
+
+<p>作用：</p>
+
+<ul>
+<li><strong>构造时间证据</strong>：WAL 上的心跳序列证明"系统在某时段确实运行过"</li>
+<li><strong>反 VM 回滚兜底</strong>：回滚 VM 会丢失 N 分钟心跳记录，与 TPM_NV_Read 的当前值对比即可发现</li>
+<li><strong>反时钟篡改</strong>：见下节</li>
+</ul>
+
+<h3>F.6.2 单调墙钟检查</h3>
+
+<pre><code>function clock_check():
+  now = system_clock()
+  if now &lt; last_seen_wall_clock - 60s:
+      → CLOCK_ROLLBACK，扣费阻断
+  if now &gt; last_seen_wall_clock + 1h 且 距离上次启动 &lt; 1h:
+      → CLOCK_JUMP_FORWARD，告警但不阻断（可能合法 NTP 校准）
+  update last_seen_wall_clock = max(last_seen_wall_clock, now)
+        持久化到 chattr +a 文件，每 10s 强制 fsync
+</code></pre>
+
+<p>结合心跳：若管理员把时钟向前调 1 年，系统计算出"已运行 1 年应有 ~525K 条心跳"但实际只有 100 条，必然失配，触发冻结。</p>
+
+<h2 id="f7">F.7 许可栈无缝切换</h2>
+
+<p>客户可能同时持有多张未过期许可（紧急加点 + 续期 + 试用赠送），扣减时需要无停机切换。</p>
+
+<pre><code>active_stack = sort_by(valid_from)([lic for lic in loaded if not expired])
+
+function pick_license_for(points):
+  for lic in active_stack:
+      if lic.remaining &gt;= points and lic.supports(meters):
+          return lic, points
+  // 允许跨许可拼接？
+  if config.allow_cross_license_split:
+      // 第 1 张吃光 + 第 2 张补上
+      splits = []
+      remaining = points
+      for lic in active_stack:
+          take = min(lic.remaining, remaining)
+          if take &gt; 0: splits.append((lic, take)); remaining -= take
+          if remaining == 0: return splits
+  return INSUFFICIENT
+</code></pre>
+
+<p>跨许可扣减时，WAL 中写一条<strong>组合记录</strong>，分别记录每张许可消耗的份额，便于审计时回溯。许可耗尽后从栈中淘汰，但<strong>不删除 WAL 中对它的引用</strong>。</p>
+
+<h2 id="f8">F.8 HA 部署 —— 离线环境的可用性策略</h2>
+
+<p>客户经常要求 BGW 高可用。在没有外部协调（如 etcd / ZooKeeper）的离线环境，三种可行模式：</p>
+
+<table>
+<thead><tr><th>模式</th><th>架构</th><th>优点</th><th>缺点</th></tr></thead>
+<tbody>
+<tr>
+<td><strong>主备 + 共享存储</strong>（推荐）</td>
+<td>NAS 上放 WAL + quota.db；主节点持文件锁 <code>flock(LOCK_EX)</code>；备节点 flock 阻塞等待</td>
+<td>实现简单；故障切换 ~5s；数据强一致</td>
+<td>NAS 单点；切换瞬间业务超时重试</td>
+</tr>
+<tr>
+<td><strong>主备 + TPM 仲裁</strong></td>
+<td>两节点都尝试增量同一 TPM 计数器，每秒一次"心跳争抢"；增量成功者保有"主"身份</td>
+<td>不依赖共享存储</td>
+<td>需要 TPM 集群（或 TPM 池），运维复杂</td>
+</tr>
+<tr>
+<td><strong>许可分片</strong></td>
+<td>签发许可时切成 N 份子许可（如 100W 点切成 2×50W），每节点独占一份；耗尽前互不影响</td>
+<td>线性扩展；无单点</td>
+<td>余额碎片化；最后一段会出现"A 还有 30W、B 已 0"的不均衡</td>
+</tr>
+</tbody>
+</table>
+
+<p>三种模式都<strong>不能完美等价</strong>于在线模式的全局强一致——离线 HA 本质上是 CAP 三选二中放弃了一致性的部分窗口（主备切换瞬间可能短暂双写）。缓解：</p>
+
+<ul>
+<li>主备模式下，备节点接管前必须先回放 NAS 上的最新 WAL；</li>
+<li>切换窗口内的扣费用 request_id 幂等覆盖；</li>
+<li>定期 audit 比对 TPM 计数器与 WAL 长度，发现双写立刻冻结并报警。</li>
+</ul>
+
+<h2 id="f9">F.9 失败模式与降级矩阵</h2>
+
+<table>
+<thead><tr><th>失败</th><th>检测</th><th>响应</th><th>是否阻断扣费</th></tr></thead>
+<tbody>
+<tr><td>fsync 失败（磁盘故障）</td><td>系统调用错误</td><td>进程 panic，K8s 重启；状态从 WAL 重建</td><td>是（临时）</td></tr>
+<tr><td>磁盘满</td><td>write ENOSPC</td><td>新请求 503；已 hold 的允许 commit；告警</td><td>是（新请求）</td></tr>
+<tr><td>WAL 段哈希断裂</td><td>启动校验失败</td><td>冻结服务；提示从最近 Daily Anchor 差量重建</td><td>是</td></tr>
+<tr><td>quota.db 损坏</td><td>打开失败</td><td>从 WAL 全量回放重建</td><td>否（透明）</td></tr>
+<tr><td>TPM 不可用</td><td>TPM_RC_FAILURE</td><td>降级到加密锁文件计数器；持续告警；进入"低信任模式"</td><td>否</td></tr>
+<tr><td>TPM 计数器倒退</td><td>启动时比对</td><td>冻结，需要厂商签发"解冻许可"</td><td>是</td></tr>
+<tr><td>时钟回拨 &gt; 60s</td><td>clock_check</td><td>立即阻断扣费，等待人工确认</td><td>是</td></tr>
+<tr><td>所有许可耗尽</td><td>pick_license 返回空</td><td>新请求 402；已 hold 的允许 commit 完成</td><td>是（新请求）</td></tr>
+<tr><td>所有许可过期</td><td>每分钟扫描</td><td>全量阻断，仅允许 audit / export 命令</td><td>是</td></tr>
+<tr><td>许可签名失效</td><td>启动校验</td><td>该许可弃用，栈中其它许可继续服务</td><td>否</td></tr>
+<tr><td>idempotency 索引丢失</td><td>启动检测</td><td>从 WAL 重建（O(N) 扫描）</td><td>否（启动期间阻塞）</td></tr>
+</tbody>
+</table>
+
+<h2 id="f10">F.10 性能与吞吐</h2>
+
+<p>纯离线模式的写吞吐由三个串行步骤决定：</p>
+
+<table>
+<thead><tr><th>操作</th><th>典型延迟</th><th>优化手段</th></tr></thead>
+<tbody>
+<tr><td>TPM NV Increment</td><td>30~80 ms</td><td>批量化：1 次 TPM 增量代表 N 条记录，记录里写 "tpm_counter + intra_batch_seq"</td></tr>
+<tr><td>WAL append + fsync</td><td>1~10 ms (SSD)</td><td>Group commit：50ms 窗口或 64 条触发一次 fsync</td></tr>
+<tr><td>SHA256 + CBOR</td><td>&lt; 0.1 ms</td><td>无需优化</td></tr>
+</tbody>
+</table>
+
+<p>启用批量化后实测目标：</p>
+
+<ul>
+<li>单节点 <strong>2000~5000 commit/s</strong>（开启 group commit + TPM 批量）</li>
+<li>p99 延迟 &lt; 100ms</li>
+<li>批量化窗口最大 50ms，最坏新请求等待半个窗口</li>
+</ul>
+
+<p><strong>批量化的代价</strong>：若窗口内崩溃，该批所有未 fsync 的扣费全部丢失。但因为<strong>未返回成功</strong>，业务侧重试即可，幂等键保证不重复。代价仅是这批请求被延迟，不会错账。</p>
+
+<h2 id="f11">F.11 端到端示意</h2>
+
+<h3>F.11.1 一次正常扣减的字段流</h3>
+
+<pre><code>Business        Writer Actor    TPM           WAL file       quota.db
+   │                │             │              │              │
+   │── commit ────►│             │              │              │
+   │                │── increment ►│              │              │
+   │                │◄── ctr=4711 │              │              │
+   │                │             │              │              │
+   │                │── append ────────────────►│              │
+   │                │                            │ O_APPEND     │
+   │                │── fsync ────────────────►│ DSYNC        │
+   │                │◄────────────────────────  │              │
+   │                │             │              │              │
+   │                │── update in-mem balance ─────────────────►│ (异步)
+   │◄── 200 OK ────│             │              │              │
+                                                  ▲
+                              （每 100 条 / 30s checkpoint 一次）
+</code></pre>
+
+<h3>F.11.2 主备切换时序（NAS + flock 模式）</h3>
+
+<pre><code>Node-A (主)     NAS (WAL+lock)    Node-B (备)
+   │                 │                 │
+   │ flock(LOCK_EX)──►                 │
+   │ holding lock   │ ◄─ flock(WAIT) ─│
+   │ serving ...    │                 │
+   │                │                 │
+   X 崩溃            │                 │
+                    │── 锁自动释放 ────►│
+                    │                 │ flock 获取
+                    │ ◄── 读 WAL tail │
+                    │                 │ recover() 流程
+                    │                 │ ready
+                    │                 │ 开始 serving
+</code></pre>
+
+<h3>F.11.3 检测 VM 快照回滚</h3>
+
+<pre><code>T0   client commit → WAL.tpm_counter = 4710
+T0+1 client commit → WAL.tpm_counter = 4711
+T0+2 client commit → WAL.tpm_counter = 4712  ← 已落盘
+T0+3 攻击者拍摄 VM 快照
+T0+4 client commit → WAL.tpm_counter = 4713
+T0+5 攻击者回滚 VM 到 T0+3
+       VM 内 WAL 最末记录 tpm_counter=4712
+       但 TPM 物理芯片上 NV_Read = 4713（无法回滚）
+T0+6 BGW 启动 recover():
+       step 5: last_record.tpm_counter (4712) &lt; tpm_counter_now (4713)
+       → 进入 "tpm_counter ahead" 分支
+       → 写 phantom_increment 记录补齐
+       → 告警 "possible_rollback_detected"
+       注：单次出现可能是合法（如步骤 6 之后的崩溃），但
+            连续多次或大幅差距即可断定为攻击
+</code></pre>
+
+<h2 id="f12">F.12 一句话总结</h2>
+
+<p>完全离线模式下扣减的正确性，由"<strong>三个不可变 + 三个串行</strong>"共同保障：</p>
+
+<ul>
+<li><strong>三个不可变</strong>：许可签名不可伪造（Ed25519）、WAL 仅追加（<code>chattr +a</code>）、TPM 计数器只增（硬件）。</li>
+<li><strong>三个串行</strong>：单写入器 actor、TPM 先于 WAL 先于内存、fsync 是耐久性的唯一界限。</li>
+</ul>
+
+<p>余额本身从来不是权威状态——它只是 WAL 的派生缓存。任何崩溃 / 损坏 / 篡改尝试，都会在下次启动 recover() 时通过哈希链与 TPM 比对暴露出来，从而进入"冻结 + 人工介入"的安全降级路径。</p>
+
 </main>
 <script>
 (function () {
