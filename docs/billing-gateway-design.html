@@ -1966,6 +1966,403 @@ T0+6 BGW 启动 recover():
 
 <p>余额本身从来不是权威状态——它只是 WAL 的派生缓存。任何崩溃 / 损坏 / 篡改尝试，都会在下次启动 recover() 时通过哈希链与 TPM 比对暴露出来，从而进入"冻结 + 人工介入"的安全降级路径。</p>
 
+<hr />
+
+<h1 id="appendix-g">附录 G：公有云 / 私有云单一代码库的统一架构</h1>
+
+<p>本附录回答：<strong>如何让公有云 SaaS 与各种形态的私有云（在线 / 半离线 / U 盘气隙 / 纯许可）共用同一份代码与同一个二进制</strong>，从而避免两套代码漂移、需求改一遍要做两次、bug 修复要同步到两侧的工程灾难。</p>
+
+<h2 id="g1">G.1 设计哲学</h2>
+
+<p>核心论断：<strong>公私两侧的业务语义其实 90% 是相同的</strong>。Meter 概念、Hold/Commit 状态机、点数计价、Usage 记录格式、Audit 哈希链——这些都不应该写两份。差异集中在<strong>基础设施层</strong>：</p>
+
+<ul>
+<li><strong>"余额从哪来"</strong>：公有云是 DB 行；私有云是许可文件解析结果</li>
+<li><strong>"状态写到哪"</strong>：公有云是 Redis + PG；私有云是 BoltDB + WAL 段文件</li>
+<li><strong>"用量上报给谁"</strong>：公有云是 Kafka → 数仓；私有云是本地归档（甚至 no-op）</li>
+<li><strong>"租户身份怎么来"</strong>：公有云是 JWT/API Key；私有云是 license 绑定的唯一租户</li>
+<li><strong>"时间锚定靠什么"</strong>：公有云是 NTP；私有云是 TPM + 心跳</li>
+</ul>
+
+<p>这些是经典的<strong>端口（Ports）</strong>——业务逻辑通过抽象接口调用，部署时注入不同的<strong>适配器（Adapters）</strong>。这就是六边形架构（Hexagonal Architecture）在计费场景的自然形态。</p>
+
+<h2 id="g2">G.2 公私差异矩阵（设计前提）</h2>
+
+<table>
+<thead><tr><th>维度</th><th>公有云</th><th>在线私有云 (A)</th><th>半离线 (B)</th><th>U 盘气隙 (C)</th><th>纯许可 (E)</th></tr></thead>
+<tbody>
+<tr><td>租户数</td><td>10K+</td><td>1~100</td><td>1~10</td><td>通常 1</td><td>通常 1</td></tr>
+<tr><td>余额来源</td><td>DB</td><td>License 镜像到 DB</td><td>License</td><td>License</td><td>License</td></tr>
+<tr><td>余额更新</td><td>实时充值</td><td>License 续期</td><td>License 续期</td><td>LRF 文件</td><td>新 License</td></tr>
+<tr><td>状态后端</td><td>Redis + PG</td><td>Redis + PG</td><td>嵌入式 KV + WAL</td><td>嵌入式 KV + WAL</td><td>嵌入式 KV + WAL</td></tr>
+<tr><td>用量上报</td><td>Kafka 实时</td><td>HTTPS 准实时</td><td>Bundle 上传</td><td>U 盘交换</td><td>无</td></tr>
+<tr><td>定价表</td><td>DB 表（可热更）</td><td>DB 表（中心下发）</td><td>License 内嵌</td><td>License 内嵌</td><td>License 内嵌</td></tr>
+<tr><td>时间源</td><td>NTP</td><td>NTP</td><td>NTP</td><td>本地 + TPM</td><td>本地 + TPM</td></tr>
+<tr><td>身份验证</td><td>OIDC / API Key</td><td>OIDC</td><td>本地 IDP</td><td>本地 IDP</td><td>本地 IDP</td></tr>
+<tr><td>HA 协调</td><td>Redis / Raft</td><td>Redis / Raft</td><td>etcd</td><td>NAS+flock</td><td>NAS+flock</td></tr>
+<tr><td>密钥管理</td><td>云 KMS</td><td>云 KMS / Vault</td><td>Vault</td><td>本地文件</td><td>本地文件 + TPM</td></tr>
+</tbody>
+</table>
+
+<p>共性比差异多得多——这正是"单代码库"成立的前提。</p>
+
+<h2 id="g3">G.3 分层架构（六边形 / Ports &amp; Adapters）</h2>
+
+<pre><code>┌────────────────────────────────────────────────────────────────┐
+│                    入站适配器 (Inbound)                        │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐   │
+│  │ HTTP REST   │  │ gRPC        │  │ Admin CLI / Audit   │   │
+│  └──────┬──────┘  └──────┬──────┘  └──────────┬──────────┘   │
+└─────────┼────────────────┼─────────────────────┼──────────────┘
+          │                │                     │
+          ▼                ▼                     ▼
+┌────────────────────────────────────────────────────────────────┐
+│            应用服务层 (Use Cases) ─ 100% 共享                  │
+│  HoldUsecase  CommitUsecase  CancelUsecase  AuditUsecase ...   │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│            领域模型 (Domain) ─ 100% 共享                       │
+│  Meter  Point  Hold  UsageRecord  License  PricingPlan  ...    │
+│  纯函数 + 不可变数据结构 + 无 IO                                 │
+└────────────────────────────────────────────────────────────────┘
+                              │
+        通过 Port 接口调用    │  （绝对不能直接 import 适配器）
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│              出站端口 (Ports) ─ 抽象接口定义                   │
+│  QuotaStore  UsageJournal  PricingSource  TimeSource           │
+│  MonotonicAnchor  EventPublisher  IdentityProvider  KeyStore   │
+└─────────────────────────┬──────────────────────────────────────┘
+                          │
+       ┌──────────────────┴──────────────────┐
+       ▼                                     ▼
+┌──────────────────────┐           ┌──────────────────────┐
+│  公有云适配器        │           │  私有云适配器        │
+│  - PgQuotaStore      │           │  - LicenseQuotaStore │
+│  - KafkaUsageJournal │           │  - WalUsageJournal   │
+│  - PgPricingSource   │           │  - LicensePricing    │
+│  - NtpTimeSource     │           │  - TpmTimeSource     │
+│  - RedisIdentity     │           │  - LocalIdentity     │
+│  - CloudKmsKeyStore  │           │  - FileKeyStore      │
+└──────────────────────┘           └──────────────────────┘
+</code></pre>
+
+<p><strong>关键约束</strong>：</p>
+
+<ol>
+<li>领域层 (Domain) 与应用层 (Use Cases) <strong>禁止 import 任何 IO 库</strong>（PG、Redis、TPM、HTTP client 等）。一行违规就会让"单代码库"承诺崩塌。</li>
+<li>所有 IO 通过 Port 接口调用，接口定义在领域层，实现位于适配器层。</li>
+<li>适配器之间互不感知——添加新适配器只需要实现端口，不需要改动现有代码。</li>
+<li>构建时通过依赖注入（DI）容器或显式 wire 把适配器装配到 Use Case。</li>
+</ol>
+
+<h2 id="g4">G.4 核心端口接口定义</h2>
+
+<p>下面用 Go 风格伪代码示意（其它语言等价）。这八个接口是公私模式的<strong>全部差异面</strong>——只要它们落实了，上层代码完全共享。</p>
+
+<pre><code>// ============================================
+// Port 1: QuotaStore - 余额读写
+// ============================================
+type QuotaStore interface {
+    Snapshot(tenantID string) (QuotaSnapshot, error)
+    Hold(ctx, op HoldOp) (HoldResult, error)
+    Commit(ctx, op CommitOp) (CommitResult, error)
+    Cancel(ctx, op CancelOp) error
+}
+// 实现：
+//   公有云 → PgQuotaStore (Redis 热 + PG 冷，Lua 原子)
+//   私有云 → LocalQuotaStore (BoltDB + 内存 actor)
+
+// ============================================
+// Port 2: UsageJournal - 用量流水持久化
+// ============================================
+type UsageJournal interface {
+    Append(ctx, record UsageRecord) error  // 同步 fsync
+    Replay(from Anchor, fn func(UsageRecord) error) error
+    DailyAnchor(date Date) (Anchor, error)
+}
+// 实现：
+//   公有云 → KafkaUsageJournal (异步高吞吐，最终入数仓)
+//   私有云 → WalUsageJournal   (本地段文件 + Merkle 链 + TPM)
+
+// ============================================
+// Port 3: PricingSource - 定价表加载
+// ============================================
+type PricingSource interface {
+    LoadActive(tenantID string, at time.Time) (PricingPlan, error)
+    LoadByVersion(version string) (PricingPlan, error)
+}
+// 实现：
+//   公有云 → DbPricingSource     (DB 表 + Redis 缓存，可热更)
+//   私有云 → LicenseEmbeddedPricing (从已加载 License 内提取)
+
+// ============================================
+// Port 4: TimeSource - 单调时间
+// ============================================
+type TimeSource interface {
+    Now() time.Time
+    AssertMonotonic() error   // 若回退超过阈值返回错误
+}
+// 实现：
+//   公有云 → NtpTimeSource (依赖系统 NTP，宽松)
+//   私有云 → AnchoredTimeSource (持久化 max_seen + heartbeat 校验)
+
+// ============================================
+// Port 5: MonotonicAnchor - 单调锚（防回滚）
+// ============================================
+type MonotonicAnchor interface {
+    Increment() (uint64, error)  // 返回严格递增的全局序号
+    Read() (uint64, error)
+}
+// 实现：
+//   公有云 → DbSequenceAnchor (PG sequence / Snowflake，无防回滚需求)
+//   私有云 → TpmNvAnchor (TPM NV counter，物理防回滚)
+//   降级   → FileLockAnchor (有 root 即可绕过，仅用于无 TPM 的开发环境)
+
+// ============================================
+// Port 6: EventPublisher - 副作用事件外发
+// ============================================
+type EventPublisher interface {
+    Publish(ctx, event Event) error
+}
+// 实现：
+//   公有云 → KafkaPublisher
+//   半离线 → BundlingPublisher (本地暂存，周期打包上传)
+//   纯许可 → NoopPublisher (空实现，编译期就 inline 掉)
+
+// ============================================
+// Port 7: IdentityProvider - 租户身份解析
+// ============================================
+type IdentityProvider interface {
+    Resolve(ctx, credentials) (Tenant, error)
+}
+// 实现：
+//   公有云 → JwtIdentityProvider
+//   私有云 → LicenseIdentityProvider (从 License 派生固定租户)
+
+// ============================================
+// Port 8: KeyStore - 签名密钥访问
+// ============================================
+type KeyStore interface {
+    Sign(keyID string, payload []byte) (Signature, error)
+    Verify(keyID string, payload, sig []byte) error
+    PublicKey(keyID string) (PublicKey, error)
+}
+// 实现：
+//   公有云 → CloudKmsKeyStore (AWS KMS / Aliyun KMS)
+//   私有云 → FileKeyStore + 可选 TPM seal
+</code></pre>
+
+<h2 id="g5">G.5 模式选择：构建时 vs 启动时</h2>
+
+<p>两种打包方式各有取舍：</p>
+
+<table>
+<thead><tr><th></th><th>构建时分离 (Build Tag)</th><th>启动时选择 (Runtime Config) <em>推荐</em></th></tr></thead>
+<tbody>
+<tr><td>实现方式</td><td><code>go build -tags=public</code> / <code>-tags=private</code></td><td>同一二进制，启动读 <code>BGW_MODE=public|private</code></td></tr>
+<tr><td>产物</td><td>两个二进制</td><td>一个二进制</td></tr>
+<tr><td>体积</td><td>各自精简</td><td>包含全部适配器（多 5~15 MB）</td></tr>
+<tr><td>CI</td><td>需要交叉构建矩阵</td><td>一次构建</td></tr>
+<tr><td>调试</td><td>难以在开发机模拟另一端</td><td>同一机器切换 mode 即可</td></tr>
+<tr><td>事故面</td><td>错装版本无法启动（明显）</td><td>错配 mode 启动可能跑错（需启动期校验）</td></tr>
+<tr><td>合规</td><td>可剥离云端代码不交付私有云</td><td>需法律评估能否交付完整二进制</td></tr>
+</tbody>
+</table>
+
+<p>多数场景推荐<strong>启动时选择</strong>，原因：</p>
+
+<ul>
+<li>开发体验远好于交叉构建——开发者本地用 <code>BGW_MODE=private+sqlite</code> 跑完整流程</li>
+<li>同一镜像可推到公有云和私有云的 registry，CI 一致</li>
+<li>合规风险通常可控（云端密钥不会随代码进入私有云，只是 KMS 适配器永远不会被实例化）</li>
+</ul>
+
+<p>若客户合同明确要求"私有云交付的二进制不得包含公有云上传相关代码"，则使用<strong>构建时分离</strong>，并通过 <code>//go:build private</code> 让 <code>KafkaUsageJournal</code> 这种文件在私有云构建中根本不存在。</p>
+
+<h2 id="g6">G.6 装配代码示例</h2>
+
+<pre><code>// cmd/billing-gateway/main.go
+func main() {
+    cfg := config.Load()  // 读取 BGW_MODE 与各项参数
+
+    deps := buildDependencies(cfg)
+    server := app.NewServer(deps)
+    server.Run()
+}
+
+func buildDependencies(cfg Config) Dependencies {
+    switch cfg.Mode {
+    case "public":
+        return Dependencies{
+            QuotaStore:      pg.NewQuotaStore(cfg.DSN, cfg.Redis),
+            UsageJournal:    kafka.NewJournal(cfg.Kafka),
+            PricingSource:   pg.NewPricingSource(cfg.DSN),
+            TimeSource:      ntp.New(),
+            MonotonicAnchor: db.NewSequenceAnchor(cfg.DSN),
+            EventPublisher:  kafka.NewPublisher(cfg.Kafka),
+            IdentityProvider: oidc.New(cfg.OIDC),
+            KeyStore:        cloudkms.New(cfg.KMSEndpoint),
+        }
+
+    case "private_online", "private_bundle":
+        return Dependencies{
+            QuotaStore:      local.NewQuotaStore(cfg.DataDir),
+            UsageJournal:    wal.NewJournal(cfg.DataDir),
+            PricingSource:   license.NewPricingSource(cfg.LicensePath),
+            TimeSource:      anchored.NewTimeSource(cfg.DataDir),
+            MonotonicAnchor: chooseAnchor(cfg),  // TPM 优先，降级文件锁
+            EventPublisher:  pickPublisher(cfg.Mode, cfg),
+            IdentityProvider: license.NewIdentityProvider(cfg.LicensePath),
+            KeyStore:        file.NewKeyStore(cfg.KeyDir),
+        }
+
+    case "private_airgap":
+        // 与 private_bundle 相同，但 EventPublisher 强制 NoopPublisher
+        // 且 PricingSource 必须从 License 派生
+        deps := buildDependencies(withMode(cfg, "private_bundle"))
+        deps.EventPublisher = noop.Publisher{}
+        return deps
+    }
+}
+
+// 应用层与领域层对所有上述选择无感知
+// app/usecase/commit.go
+func (u *CommitUseCase) Execute(ctx, req CommitRequest) (CommitResponse, error) {
+    // 整段代码两侧 100% 一致
+    plan, err := u.pricing.LoadByVersion(req.PricingVersion)
+    points := plan.Calculate(req.Items)
+    snap, _ := u.quota.Snapshot(req.TenantID)
+    if snap.Available() &lt; points { return ErrInsufficient }
+
+    seq, _ := u.anchor.Increment()
+    record := domain.NewUsageRecord(req, points, seq, u.time.Now())
+
+    if err := u.journal.Append(ctx, record); err != nil { return err }
+    if _, err := u.quota.Commit(ctx, ...); err != nil { return err }
+    _ = u.publisher.Publish(ctx, record.ToEvent())  // 私有云气隙模式下是 no-op
+    return CommitResponse{...}, nil
+}
+</code></pre>
+
+<h2 id="g7">G.7 测试策略：契约测试 + 双模式集成</h2>
+
+<p>单代码库最容易出问题的地方是<strong>"领域层不变但适配器行为差异导致 bug"</strong>。三层测试拦截：</p>
+
+<table>
+<thead><tr><th>层级</th><th>测试对象</th><th>跑几次</th></tr></thead>
+<tbody>
+<tr><td>领域/应用层单测</td><td>UseCase + Domain，依赖全部 mock</td><td>1 次</td></tr>
+<tr><td><strong>端口契约测试</strong></td><td>每个 Port 接口定义统一行为契约，所有实现必须通过</td><td>N 次（每实现一遍）</td></tr>
+<tr><td>模式集成测试</td><td>启动整套服务，端到端跑业务流</td><td>5 次（每种部署形态）</td></tr>
+</tbody>
+</table>
+
+<p>契约测试示例：</p>
+
+<pre><code>// internal/ports/contract/quota_contract.go
+func QuotaStoreContract(t *testing.T, factory func() QuotaStore) {
+    t.Run("hold_then_commit_decreases_balance", func(t *testing.T) {
+        q := factory()
+        q.Seed(tenant, 1000)
+        h, _ := q.Hold(ctx, HoldOp{Points: 200})
+        q.Commit(ctx, CommitOp{HoldID: h.ID, Actual: 150})
+        assert.Equal(t, 850, q.Snapshot(tenant).Available())
+    })
+    t.Run("expired_hold_is_released", func(t *testing.T) { ... })
+    t.Run("concurrent_holds_no_double_spend", func(t *testing.T) { ... })
+    t.Run("idempotent_commit", func(t *testing.T) { ... })
+    // ... 共 ~30 条契约
+}
+
+// 三个实现各自调用同一份契约
+func TestPgQuotaStore(t *testing.T)     { QuotaStoreContract(t, newPgFactory) }
+func TestLocalQuotaStore(t *testing.T)  { QuotaStoreContract(t, newLocalFactory) }
+func TestInMemQuotaStore(t *testing.T)  { QuotaStoreContract(t, newMemFactory) }
+</code></pre>
+
+<p>这种做法保证：任何一种实现行为偏离规约，CI 立刻红。<strong>领域层不需要任何 if mode == "private" 这种分支</strong>——这是衡量分层是否健康的最关键指标。</p>
+
+<h2 id="g8">G.8 部署形态 → 适配器选择映射</h2>
+
+<table>
+<thead><tr><th>Port</th><th>公有云</th><th>私有云在线</th><th>半离线</th><th>U 盘气隙</th><th>纯许可</th></tr></thead>
+<tbody>
+<tr><td>QuotaStore</td><td>PgQuotaStore</td><td>PgQuotaStore</td><td>LocalQuotaStore</td><td>LocalQuotaStore</td><td>LocalQuotaStore</td></tr>
+<tr><td>UsageJournal</td><td>KafkaJournal</td><td>HttpJournal</td><td>BundlingWalJournal</td><td>WalJournal</td><td>WalJournal</td></tr>
+<tr><td>PricingSource</td><td>PgPricing</td><td>RemoteSyncPricing</td><td>LicensePricing</td><td>LicensePricing</td><td>LicensePricing</td></tr>
+<tr><td>TimeSource</td><td>NtpTime</td><td>NtpTime</td><td>NtpTime</td><td>AnchoredTime</td><td>AnchoredTime</td></tr>
+<tr><td>MonotonicAnchor</td><td>DbSeqAnchor</td><td>DbSeqAnchor</td><td>TpmAnchor</td><td>TpmAnchor</td><td>TpmAnchor</td></tr>
+<tr><td>EventPublisher</td><td>KafkaPublisher</td><td>HttpsPublisher</td><td>BundlingPublisher</td><td>FileExportPublisher</td><td>NoopPublisher</td></tr>
+<tr><td>IdentityProvider</td><td>OidcIdentity</td><td>OidcIdentity</td><td>LocalIdpIdentity</td><td>LicenseIdentity</td><td>LicenseIdentity</td></tr>
+<tr><td>KeyStore</td><td>CloudKms</td><td>VaultKeyStore</td><td>VaultKeyStore</td><td>FileKeyStore+TPM</td><td>FileKeyStore+TPM</td></tr>
+</tbody>
+</table>
+
+<p>所有列共用上层 UseCase 与 Domain，差异收敛到底部适配器层 + 启动时的装配代码（约 200 行）。</p>
+
+<h2 id="g9">G.9 反模式与陷阱</h2>
+
+<table>
+<thead><tr><th>反模式</th><th>为什么糟糕</th><th>正确做法</th></tr></thead>
+<tbody>
+<tr><td><code>if isPrivateCloud() { ... } else { ... }</code> 散布在 UseCase 中</td><td>每加一种模式 N 个地方都要改；新人无法理解全貌</td><td>把差异提到 Port，让 UseCase 不感知</td></tr>
+<tr><td>领域层 import <code>github.com/aws/...</code> 或 <code>database/sql</code></td><td>领域逻辑被绑死，私有云构建直接失败或带入云依赖</td><td>领域层只能依赖标准库 + 自己定义的接口</td></tr>
+<tr><td>共享 Protobuf 中混入公有云专属字段</td><td>私有云客户审计代码时看到 <code>cloud_account_id</code> 会问"为什么这字段在我这"</td><td>对外协议分两组；内部领域模型只保留公共字段</td></tr>
+<tr><td>用配置开关控制业务语义差异</td><td><code>EnableHardLimit=true</code> 这种配置代表逻辑分支，本质是 if-else</td><td>用 Port + 不同 Adapter 表达；或用 Strategy 模式</td></tr>
+<tr><td>公有云专属功能直接调用 SDK</td><td>SDK 被 import 进 Use Case，私有云构建混入冗余</td><td>SDK 调用包裹在适配器内，UseCase 只依赖 Port</td></tr>
+<tr><td>测试只跑公有云路径（"私有云上线再测"）</td><td>真正交付时才发现 WAL 实现哈希链有 bug</td><td>CI 矩阵必须覆盖每种适配器，契约测试同跑</td></tr>
+<tr><td>License 解析逻辑写在主流程</td><td>公有云代码里夹着私有云逻辑，污染心智模型</td><td>License 解析是 <code>LicenseQuotaStore</code> / <code>LicensePricing</code> 内部细节</td></tr>
+<tr><td>把"私有云不需要 X"做成空表/空 DB</td><td>资源浪费 + 维护两套 schema 同步</td><td>用 NoopAdapter 编译期消除该路径</td></tr>
+</tbody>
+</table>
+
+<h2 id="g10">G.10 演进路径（强烈建议）</h2>
+
+<p>大多数团队都是<strong>先做了公有云，后要支持私有云</strong>。直接重构成上述架构成本高，建议分四阶段：</p>
+
+<ol>
+<li>
+<strong>阶段 1：识别端口（不改代码）</strong>
+<ul>
+<li>梳理出公有云代码里所有"会在私有云改写"的调用点（DB / Kafka / KMS / 时间 / 身份）</li>
+<li>画出未来私有云需要的实现，文档化对照表</li>
+<li>立即开始：所有<strong>新</strong>需求严格走 Port，老代码暂缓</li>
+</ul>
+</li>
+<li>
+<strong>阶段 2：抽取端口（无行为变化）</strong>
+<ul>
+<li>每周抽 1~2 个端口：定义 interface、把现有实现包成 Adapter、用 DI 替换直接调用</li>
+<li>每次抽取 PR 必须零业务行为变化，纯重构</li>
+<li>同时编写契约测试（即便此时只有一个实现，契约用于将来）</li>
+</ul>
+</li>
+<li>
+<strong>阶段 3：第一个私有云适配器（增量交付）</strong>
+<ul>
+<li>选最简单的形态先做（推荐"在线私有云" A 类，复用最多）</li>
+<li>实现 <code>LocalQuotaStore</code>、<code>WalUsageJournal</code> 等</li>
+<li>跑通契约测试，再跑模式集成测试</li>
+<li>第一个客户上线，反馈迭代</li>
+</ul>
+</li>
+<li>
+<strong>阶段 4：扩展到更严苛形态（边际成本递减）</strong>
+<ul>
+<li>添加 U 盘气隙、纯许可模式只需要替换 1~2 个适配器（如 Publisher 换成 NoopPublisher、Anchor 换成 TpmAnchor）</li>
+<li>领域层一行都不动</li>
+<li>新形态的边际开发成本应当显著低于第一个私有云形态——如果不是，说明分层抽象不够彻底，回到阶段 2 再抽几个端口</li>
+</ul>
+</li>
+</ol>
+
+<h2 id="g11">G.11 一句话总结</h2>
+
+<p>单代码库的关键不是"代码长得一样"，而是<strong>"业务逻辑层从不知道自己在哪种云上"</strong>。把所有"在不同云上长得不一样"的东西都关进端口/适配器的盒子里，领域层与用例层就能在公私两侧无差别复用——这才是真正意义的"一套代码"。</p>
+
 </main>
 <script>
 (function () {
