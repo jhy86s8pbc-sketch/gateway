@@ -2363,6 +2363,345 @@ func TestInMemQuotaStore(t *testing.T)  { QuotaStoreContract(t, newMemFactory) }
 
 <p>单代码库的关键不是"代码长得一样"，而是<strong>"业务逻辑层从不知道自己在哪种云上"</strong>。把所有"在不同云上长得不一样"的东西都关进端口/适配器的盒子里，领域层与用例层就能在公私两侧无差别复用——这才是真正意义的"一套代码"。</p>
 
+<hr />
+
+<h1 id="appendix-h">附录 H：降低各产线接入成本</h1>
+
+<p>前面几个附录解决的是<strong>计费网关自身</strong>如何在公私云统一。本附录解决另一个同样重要的问题：<strong>短信、LLM、TTS、图像、知识库检索等各条产线，如何用最小代价接入计费网关，并且接入方式在公有云和私有云完全一致</strong>——产线团队不应该感知到自己跑在哪种云上。</p>
+
+<h2 id="h1">H.1 接入成本到底来自哪里</h2>
+
+<p>"对接成本"不是单一数字，拆开看有六块，每一块都要单独压：</p>
+
+<table>
+<thead><tr><th>成本项</th><th>典型痛点</th><th>本附录对策</th></tr></thead>
+<tbody>
+<tr><td>学习成本</td><td>每个产线都要读懂 hold/commit/cancel、幂等、流式</td><td>统一 SDK 把概念封装成 2~3 个方法（H.3）</td></tr>
+<tr><td>编码成本</td><td>正确处理预扣、冲正、重试、超时要写上百行</td><td>SDK / Sidecar / 拦截器三档接入（H.2）</td></tr>
+<tr><td>计量成本</td><td>token 怎么数、SMS 怎么算、各产线各写一套</td><td>计量提取器标准库（H.6）</td></tr>
+<tr><td>公私差异成本</td><td>担心私有云要改接入代码</td><td>SDK 屏蔽 endpoint 形态，产线零改动（H.3.2）</td></tr>
+<tr><td>测试成本</td><td>没有计费环境无法联调</td><td>沙箱 + Mock + doctor 自检（H.9）</td></tr>
+<tr><td>维护成本</td><td>计费网关升级，产线被迫跟着改</td><td>协议版本化 + 兼容契约（H.12）</td></tr>
+</tbody>
+</table>
+
+<h2 id="h2">H.2 三档接入方式（按侵入度自选）</h2>
+
+<p>不强制所有产线用同一种接入方式——给三档，让产线按自己的技术栈和侵入容忍度选：</p>
+
+<table>
+<thead><tr><th>档位</th><th>方式</th><th>产线改动量</th><th>适用</th></tr></thead>
+<tbody>
+<tr>
+<td><strong>档 1：SDK 内嵌</strong></td>
+<td>引入计费 SDK，在业务代码里显式调用</td>
+<td>~5~15 行</td>
+<td>需要精细控制（流式、跨 meter 组合、动态定价）</td>
+</tr>
+<tr>
+<td><strong>档 2：Sidecar 透明代理</strong></td>
+<td>旁挂一个 billing-sidecar，拦截进出流量自动计费</td>
+<td><strong>0 行业务代码</strong>（只加部署配置）</td>
+<td>标准 HTTP/gRPC 产线，计量可从请求/响应自动提取</td>
+</tr>
+<tr>
+<td><strong>档 3：框架中间件</strong></td>
+<td>引入 HTTP middleware / gRPC interceptor</td>
+<td>~1 行（注册中间件）</td>
+<td>用主流框架、希望声明式但不想加 Sidecar</td>
+</tr>
+</tbody>
+</table>
+
+<pre><code>侵入度：  档1 SDK  &gt;  档3 中间件  &gt;  档2 Sidecar
+控制力：  档1 SDK  &gt;  档3 中间件  &gt;  档2 Sidecar
+推荐默认：标准产线用 档2/档3，特殊产线用 档1
+</code></pre>
+
+<h2 id="h3">H.3 统一接入 SDK 设计</h2>
+
+<h3>H.3.1 把五个概念压成两个方法</h3>
+
+<p>产线不需要理解 hold/commit/cancel/idempotency/streaming——SDK 用一个 <code>Charge</code> 装饰器 / 上下文管理器收口：</p>
+
+<pre><code>// Go：同步调用
+result, err := billing.Charge(ctx, billing.Meter("sms.cn.normal"), 1,
+    func() (Response, Usage, error) {
+        resp := sendSMS(req)                 // 产线真实业务
+        return resp, billing.Units(1), nil   // 报告实际用量
+    })
+// SDK 内部自动完成：pre-check → hold → 执行 → commit(实际) → 失败 cancel
+
+# Python：上下文管理器
+with billing.charge(meter="llm.gpt4o", estimate=est_tokens(req)) as bill:
+    resp = call_llm(req)
+    bill.actual(input=resp.usage.input, output=resp.usage.output)
+# 退出 with 块自动 commit；抛异常自动 cancel
+</code></pre>
+
+<pre><code>// TypeScript：高阶函数
+const resp = await billing.charge(
+  { meter: "tts.zh", estimate: estimateSeconds(req) },
+  async (bill) =&gt; {
+    const audio = await synthesize(req);
+    bill.actual(audio.durationSec);
+    return audio;
+  }
+);
+</code></pre>
+
+<p>SDK 替产线兜住的全部脏活：</p>
+
+<ul>
+<li>预检 + 预扣（hold），余额不足直接抛 <code>InsufficientPointsError</code></li>
+<li>业务成功 → 用实际用量 commit；多退少补自动算</li>
+<li>业务抛异常 / panic / 超时 → 自动 cancel，释放预扣</li>
+<li>幂等键自动生成（基于 request_id），网络重试不重复扣费</li>
+<li>commit 网络抖动 → 退避重试，仍失败则进本地补偿队列</li>
+<li>埋点 metric / trace 自动打</li>
+</ul>
+
+<h3>H.3.2 公私云对产线完全透明</h3>
+
+<p>这是降低成本的<strong>最关键一点</strong>。SDK 的 <code>Target</code> 解析隐藏了"计费网关在哪"：</p>
+
+<pre><code>┌──────────── 产线进程 ────────────┐
+│  业务代码（永远不变）             │
+│        │ billing.Charge(...)      │
+│        ▼                          │
+│   Billing SDK                     │
+│        │ 按环境解析 Target        │
+└────────┼──────────────────────────┘
+         │
+   ┌─────┴─────────────────────────────────────┐
+   ▼                ▼                ▼           ▼
+ 公有云           私有云在线       气隙          单测
+ 远程 gRPC        本地 gRPC      同进程 in-proc   in-memory
+ billing.svc      localhost      Unix socket     fake
+ :443             :8080          /run/bgw.sock
+</code></pre>
+
+<p>产线代码完全不变，只是部署时注入不同的 <code>BILLING_TARGET</code>：</p>
+
+<table>
+<thead><tr><th>部署</th><th>BILLING_TARGET</th><th>传输</th></tr></thead>
+<tbody>
+<tr><td>公有云</td><td><code>grpcs://billing.internal:443</code></td><td>mTLS gRPC</td></tr>
+<tr><td>私有云在线</td><td><code>grpc://localhost:8080</code></td><td>本地 gRPC</td></tr>
+<tr><td>气隙（同机部署）</td><td><code>unix:///run/bgw.sock</code></td><td>Unix domain socket</td></tr>
+<tr><td>极致低延迟</td><td><code>inproc://</code></td><td>SDK 直接 link 计费库，进程内调用</td></tr>
+<tr><td>开发 / 单测</td><td><code>mock://</code></td><td>内存 fake，给定额度</td></tr>
+</tbody>
+</table>
+
+<p>SDK 暴露的接口在所有 Target 下行为一致（由附录 G 的端口契约测试保证）。产线团队接入一次，公有云和私有云<strong>同一份代码、同一个镜像</strong>跑通。</p>
+
+<h2 id="h4">H.4 声明式 Meter 清单（Meter Manifest）</h2>
+
+<p>不要让产线在代码里硬编码 meter 字符串和计费单位——容易写错、改价要改代码。改成<strong>声明式清单 + 启动注册</strong>：</p>
+
+<pre><code># 产线仓库内 billing-meters.yaml
+product_line: sms-service
+version: 1
+meters:
+  - code: sms.cn.normal
+    display: 国内普通短信
+    raw_unit: message          # 计量单位
+    extractor: count.request_field
+    extractor_config:
+      field: $.recipients[*]    # 从请求里数收件人个数
+  - code: sms.cn.marketing
+    display: 国内营销短信
+    raw_unit: message
+    extractor: count.request_field
+    extractor_config:
+      field: $.recipients[*]
+  - code: sms.intl
+    display: 国际短信
+    raw_unit: message
+    dimensions: [region]        # 按地区分档，价格由计费侧定
+</code></pre>
+
+<p>启动时 SDK 自动把清单注册到计费网关（公有云注册到中心、私有云校验是否在 License 的 <code>meters_allowed</code> 内）。<strong>价格永远不在产线侧</strong>——产线只声明"我有哪些可计费动作、怎么数量"，"一个动作值多少点"由计费侧的 Pricing Plan / License 决定。这样改价不需要产线发版。</p>
+
+<h2 id="h5">H.5 Sidecar 透明代理（零代码接入）</h2>
+
+<p>对标准 HTTP/gRPC 产线，最低成本是<strong>完全不改代码</strong>，旁挂 Sidecar：</p>
+
+<pre><code>          ┌─────────────── Pod / 同机 ───────────────┐
+ client ──►│ billing-sidecar :8000 ──► 产线服务 :9000 │
+          │       │  1. 拦截请求，按 manifest 提取计量  │
+          │       │  2. 调本地/远程计费网关 hold        │
+          │       │  3. 转发给产线服务                  │
+          │       │  4. 拦截响应，提取实际用量          │
+          │       │  5. commit（失败则 cancel）         │
+          │       │  6. 把响应返回 client               │
+          └────────────────────────────────────────────┘
+</code></pre>
+
+<p>Sidecar 配置完全声明式：</p>
+
+<pre><code># sidecar.yaml
+upstream: http://127.0.0.1:9000
+billing_target: ${BILLING_TARGET}    # 公私云只改这一个
+routes:
+  - match: { path: /v1/sms/send, method: POST }
+    meter: sms.cn.normal
+    estimate: { extractor: count.json, path: $.recipients[*] }
+    actual:   { extractor: count.json, path: $.recipients[*] }
+  - match: { path: /v1/chat/completions, method: POST }
+    meter: llm.gpt4o
+    estimate: { extractor: llm.max_tokens }       # 用 max_tokens 预扣
+    actual:   { extractor: llm.openai_usage }      # 从响应 usage 字段读真实值
+    streaming: sse                                 # 自动处理流式
+</code></pre>
+
+<p>适用边界：计量值能从请求/响应里<strong>结构化提取</strong>的产线适合 Sidecar；如果计量逻辑很动态（如按生成图片的复杂度算），用 SDK 档位更合适。</p>
+
+<h2 id="h6">H.6 计量提取器标准库（Metering Extractors）</h2>
+
+<p>"怎么数量"是每条产线最容易各写一套、各写各错的地方。把常见模式做成<strong>内置提取器</strong>，产线选用而非自研：</p>
+
+<table>
+<thead><tr><th>提取器</th><th>用途</th><th>示例</th></tr></thead>
+<tbody>
+<tr><td><code>count.json</code></td><td>数 JSONPath 命中数</td><td>SMS 收件人数、批量请求条数</td></tr>
+<tr><td><code>llm.openai_usage</code></td><td>解析 OpenAI 风格 <code>usage</code> 字段</td><td>input/output tokens</td></tr>
+<tr><td><code>llm.anthropic_usage</code></td><td>解析 Anthropic 风格 usage</td><td>含 cache_read / cache_write tokens</td></tr>
+<tr><td><code>llm.max_tokens</code></td><td>预扣阶段用 max_tokens 上界</td><td>hold 估算</td></tr>
+<tr><td><code>llm.local_tokenizer</code></td><td>本地 tokenizer 精确计数（私有模型无 usage 字段时）</td><td>自研模型计费</td></tr>
+<tr><td><code>audio.duration</code></td><td>从音频时长算</td><td>TTS / ASR 秒数</td></tr>
+<tr><td><code>image.spec</code></td><td>按分辨率 × 张数 × 步数</td><td>文生图</td></tr>
+<tr><td><code>weight.const</code></td><td>固定权重</td><td>一次检索固定 N 点</td></tr>
+<tr><td><code>header.field</code></td><td>从响应头读用量</td><td>上游已算好用量的代理场景</td></tr>
+</tbody>
+</table>
+
+<p>提取器是公私云共享的纯函数（无 IO），同样跑契约测试。产线 95% 场景靠选配置完成计量，无需写代码。剩余 5% 特殊场景实现 <code>Extractor</code> 接口（一个方法）即可。</p>
+
+<h2 id="h7">H.7 流式与异步场景的封装</h2>
+
+<p>流式（LLM SSE、TTS 流式合成）是产线最容易做错的地方，SDK 必须封装好：</p>
+
+<pre><code>// 产线只管吐 chunk，计费由 SDK 滚动处理
+stream := billing.ChargeStream(ctx, billing.Meter("llm.gpt4o"),
+    billing.Estimate(maxTokens))
+defer stream.Close()   // 自动 finalize：已生成的 commit，未用的退还
+
+for chunk := range llmStream {
+    stream.Observe(chunk.Tokens)   // SDK 内部滚动 hold/partial-commit
+    send(chunk)
+}
+// 客户端中途断开 → defer Close 把已生成部分 commit、剩余 hold cancel
+</code></pre>
+
+<p>异步任务（如批量图像生成、离线转写）用回执模式：</p>
+
+<pre><code>ticket := billing.ChargeAsync(ctx, meter, estimate)   // 先 hold，返回票据
+// ... 任务进入队列，几分钟后完成 ...
+billing.Finalize(ticket.ID, actualUsage)              // 完成时 commit
+// 任务失败/超时由 SDK 的 reaper 自动 cancel 过期票据
+</code></pre>
+
+<h2 id="h8">H.8 统一错误语义与重试</h2>
+
+<p>各产线最怕"计费返回个错误，不知道该重试还是该放弃"。SDK 把错误归一成三类，每类有明确动作：</p>
+
+<table>
+<thead><tr><th>错误类</th><th>含义</th><th>SDK 默认动作</th><th>产线该做</th></tr></thead>
+<tbody>
+<tr><td><code>BillingDenied</code></td><td>余额不足 / 许可过期 / meter 未授权</td><td>立即抛出，不重试</td><td>向终端用户返回 402 + 升级引导</td></tr>
+<tr><td><code>BillingUnavailable</code></td><td>计费网关临时不可达</td><td>退避重试 N 次，仍失败按 fail-policy</td><td>通常无需处理</td></tr>
+<tr><td><code>BillingInternal</code></td><td>计费侧 bug / 数据异常</td><td>记录 + 告警，按 fail-policy</td><td>无需处理，等修复</td></tr>
+</tbody>
+</table>
+
+<p><code>fail-policy</code> 是产线可配的关键策略（计费网关短暂不可用时怎么办）：</p>
+
+<pre><code>fail_policy:
+  on_unavailable: fail_open | fail_closed | local_queue
+    # fail_open   : 放行业务，用量进本地补偿队列，恢复后补扣（重可用性）
+    # fail_closed : 拒绝业务，返回 503（重计费准确，金融/计量严格场景）
+    # local_queue : 私有云推荐——本地 WAL 本就不依赖中心，直接落账
+</code></pre>
+
+<p>私有云因为计费就在本地（甚至同进程），<code>BillingUnavailable</code> 几乎不会发生，<code>fail-policy</code> 主要服务公有云的网络抖动。产线配一次，公私通用。</p>
+
+<h2 id="h9">H.9 接入自检、沙箱与 Mock</h2>
+
+<p>让产线<strong>在没有真实计费环境时也能完成 90% 联调</strong>，是降低对接成本的关键：</p>
+
+<table>
+<thead><tr><th>工具</th><th>作用</th></tr></thead>
+<tbody>
+<tr><td><code>billing doctor</code></td><td>静态检查 manifest 合法性、meter 命名规范、extractor 配置可解析、与计费网关连通性</td></tr>
+<tr><td>Mock Target (<code>mock://</code>)</td><td>SDK 内存实现，给定初始额度，单测里完整跑 hold/commit/cancel，无需任何外部依赖</td></tr>
+<tr><td>Sandbox 计费网关</td><td>独立部署的"演练环境"，行为与生产一致但用虚拟点数，可随意造数据</td></tr>
+<tr><td>Replay 校验</td><td>录制产线生产流量，回放到 sandbox，比对计费结果，上线前发现计量偏差</td></tr>
+<tr><td>计量 lint</td><td>对接评审时自动检查：是否所有可计费接口都接了计费、有没有遗漏的免费后门</td></tr>
+</tbody>
+</table>
+
+<pre><code>$ billing doctor
+[OK]   billing-meters.yaml 语法合法
+[OK]   3 个 meter 命名符合规范 (sms.cn.normal, ...)
+[OK]   extractor 'count.json' 配置可解析
+[WARN] meter 'sms.intl' 声明了 dimension [region] 但路由未提供提取规则
+[OK]   连通性: mock:// 可用
+[INFO] 生产 Target 未配置（开发环境正常）
+集成就绪度: 90%（修复 1 个 WARN 后达 100%）
+</code></pre>
+
+<h2 id="h10">H.10 多语言 SDK 的一致性保障</h2>
+
+<p>产线用 Go / Java / Python / Node / Rust 各不相同。多语言 SDK 最大风险是<strong>行为漂移</strong>（Python SDK 的重试逻辑和 Go 的不一样）。三个手段保证一致：</p>
+
+<ol>
+<li><strong>协议优先</strong>：hold/commit/cancel 用 Protobuf + gRPC 定义，所有 SDK 从同一份 <code>.proto</code> 生成传输层，杜绝手写协议分歧。</li>
+<li><strong>共享行为契约测试集</strong>：一份语言无关的契约测试用例（YAML 描述的场景 + 期望），每个 SDK 都跑同一套，CI 强制通过。例如"hold 后业务抛异常 → 必须发出 cancel"。</li>
+<li><strong>薄 SDK 原则</strong>：复杂逻辑（计量、定价、状态机）尽量下沉到计费网关，SDK 只做"调用 + 重试 + 幂等 + 提取器"这层薄封装。SDK 越薄，多语言一致性越容易保证。</li>
+</ol>
+
+<pre><code>          ┌─────────── 单一 .proto + 契约用例 ───────────┐
+          ▼            ▼            ▼            ▼
+       Go SDK      Java SDK     Python SDK    Node SDK
+          │            │            │            │
+          └────────────┴─── 同一套契约测试 ──┴────────────┘
+                       全部 CI 绿才允许发布
+</code></pre>
+
+<h2 id="h11">H.11 接入 Checklist 与典型工时</h2>
+
+<table>
+<thead><tr><th>步骤</th><th>SDK 档</th><th>Sidecar 档</th></tr></thead>
+<tbody>
+<tr><td>1. 写 <code>billing-meters.yaml</code></td><td>~0.5h</td><td>~0.5h</td></tr>
+<tr><td>2. 选/配计量提取器</td><td>~0.5h</td><td>~0.5h</td></tr>
+<tr><td>3. 业务代码接入</td><td>~1h（包几个调用）</td><td>0h（不改代码）</td></tr>
+<tr><td>4. 配置 fail-policy</td><td>~0.2h</td><td>~0.2h</td></tr>
+<tr><td>5. <code>billing doctor</code> + Mock 单测</td><td>~1h</td><td>~0.5h</td></tr>
+<tr><td>6. Sandbox 联调 + Replay 校验</td><td>~1h</td><td>~1h</td></tr>
+<tr><td><strong>合计</strong></td><td><strong>~0.5 人日</strong></td><td><strong>~0.3 人日</strong></td></tr>
+<tr><td>公有云 → 私有云额外成本</td><td colspan="2"><strong>0</strong>（只改 BILLING_TARGET 环境变量）</td></tr>
+</tbody>
+</table>
+
+<h2 id="h12">H.12 协议版本化与向后兼容</h2>
+
+<p>降低对接成本不止于"首次接入快"，更要保证<strong>计费网关升级不逼产线跟着发版</strong>：</p>
+
+<ul>
+<li><strong>Proto 只增不改</strong>：字段只追加、不复用 tag、不改语义；废弃字段标 <code>deprecated</code> 保留。</li>
+<li><strong>SDK 与网关版本协商</strong>：握手时交换能力集，新功能对老 SDK 自动降级。</li>
+<li><strong>meter / 定价变更不影响产线</strong>：价格在计费侧，产线无感；新增 meter 维度走清单声明，老 meter 不动。</li>
+<li><strong>N-2 兼容承诺</strong>：网关至少兼容前两个大版本的 SDK，给产线充足升级窗口。</li>
+<li><strong>契约测试护栏</strong>：任何破坏兼容的改动会让历史契约用例失败，CI 直接拦下。</li>
+</ul>
+
+<h2 id="h13">H.13 一句话总结</h2>
+
+<p>降低产线对接成本的核心是<strong>三个"不应该"</strong>：产线不应该感知公私云差异（SDK 屏蔽 Target）、产线不应该关心点数定价（只声明 meter 与计量、价格在计费侧）、产线不应该重复实现计费正确性（hold/commit/重试/幂等/流式全在 SDK 与 Sidecar 里）。做到这三点，新产线接入从"周"压到"半天"，且公有云接入完即私有云接入完。</p>
+
 </main>
 <script>
 (function () {
