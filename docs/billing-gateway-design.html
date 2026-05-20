@@ -2702,6 +2702,246 @@ billing.Finalize(ticket.ID, actualUsage)              // 完成时 commit
 
 <p>降低产线对接成本的核心是<strong>三个"不应该"</strong>：产线不应该感知公私云差异（SDK 屏蔽 Target）、产线不应该关心点数定价（只声明 meter 与计量、价格在计费侧）、产线不应该重复实现计费正确性（hold/commit/重试/幂等/流式全在 SDK 与 Sidecar 里）。做到这三点，新产线接入从"周"压到"半天"，且公有云接入完即私有云接入完。</p>
 
+<hr />
+
+<h1 id="appendix-i">附录 I：统一计量计费管道</h1>
+
+<p>前面各附录分别解决了点数模型、公私云、离线、单代码库、产线接入。本附录把它们<strong>串成一条端到端的统一管道</strong>，回答："来自任意产线、任意云形态的用量，如何走<strong>同一条</strong>计量→计费链路，得到一致、可对账、可分析的结果"。统一是目标，前面所有设计都是为它服务的。</p>
+
+<h2 id="i1">I.1 为什么必须"统一"</h2>
+
+<p>不统一的典型恶果：短信团队自己算钱、LLM 团队自己扣费、私有云又是另一套脚本——结果是<strong>对账对不齐、口径各不同、改价要改 N 处、新产线重复造轮子</strong>。统一计量计费要消灭三种异构：</p>
+
+<table>
+<thead><tr><th>异构</th><th>不统一的后果</th><th>统一手段</th></tr></thead>
+<tbody>
+<tr><td>计量源异构</td><td>SMS 按条、LLM 按 token、TTS 按秒，各产线各报各的</td><td>统一事件模型 UsageEvent（I.3）</td></tr>
+<tr><td>计费口径异构</td><td>有的按元、有的按次、私有云按 License，对账无法合并</td><td>统一点数 + 统一计价引擎（I.6）</td></tr>
+<tr><td>部署形态异构</td><td>公有云实时、私有云离线，两套计量管道</td><td>同一管道、末端适配（I.13）</td></tr>
+</tbody>
+</table>
+
+<h2 id="i2">I.2 六段式统一管道</h2>
+
+<p>所有用量，无论来自哪条产线、哪种云，都流经同一条六段管道：</p>
+
+<pre><code>┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
+│ ①计量   │─►│ ②归一   │─►│ ③计价   │─►│ ④计费   │─►│ ⑤结算   │─►│ ⑥对账   │
+│ Metering │  │Normalize │  │ Pricing  │  │ Charging │  │ Settle   │  │ Reconcile│
+└──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘
+ 采集/去重    原始单位→     标准单位→     点数→余额     点数→账单     计量vs计费
+ /聚合        标准计量单位   点数          扣减(hold/                  一致性闭环
+                                          commit)
+   │             │             │             │             │             │
+   产线/Sidecar  计量提取器    Pricing Plan  QuotaStore   Settlement   Audit/Merkle
+                              /License内嵌   (公私适配)    Engine
+</code></pre>
+
+<table>
+<thead><tr><th>段</th><th>输入</th><th>输出</th><th>职责</th></tr></thead>
+<tbody>
+<tr><td>①计量 Metering</td><td>业务调用</td><td>原始用量事件</td><td>采集、去重、按窗口聚合</td></tr>
+<tr><td>②归一 Normalize</td><td>原始用量（条/token/秒）</td><td>标准计量单位</td><td>统一量纲、补全维度</td></tr>
+<tr><td>③计价 Pricing</td><td>标准计量单位</td><td>点数</td><td>查 Pricing Plan / License 折算</td></tr>
+<tr><td>④计费 Charging</td><td>点数</td><td>余额变更</td><td>hold/commit/cancel</td></tr>
+<tr><td>⑤结算 Settlement</td><td>点数流水</td><td>账单</td><td>周期汇总、分摊、出账</td></tr>
+<tr><td>⑥对账 Reconcile</td><td>计量 + 计费记录</td><td>差异报告</td><td>一致性校验、闭环</td></tr>
+</tbody>
+</table>
+
+<p><strong>关键</strong>：计量与计费之间用②③解耦——产线只管"用了多少原始单位"（①②），平台负责"折多少点、扣多少钱"（③④）。改价只动③，产线和计量层完全不感知。</p>
+
+<h2 id="i3">I.3 统一事件模型 UsageEvent</h2>
+
+<p>整条管道的"普通话"是一个 canonical 事件结构。所有产线、所有云，最终都产出它——这是统一的基石：</p>
+
+<pre><code>message UsageEvent {
+  // ===== 身份维度（谁用的）=====
+  string event_id     = 1;   // 全局唯一，幂等键
+  string tenant_id    = 2;
+  string product_line = 3;   // sms / llm / tts / image ...
+  string deployment_id= 4;   // 公有云为空；私有云实例标识
+
+  // ===== 计量维度（用了什么、多少）=====
+  string meter_code   = 5;   // llm.gpt4o.output
+  double raw_usage    = 6;   // 481
+  string raw_unit     = 7;   // token
+  map&lt;string,string&gt; dimensions = 8;  // {region:cn, model:gpt4o, ...}
+
+  // ===== 计价快照（按什么价算的）=====
+  string pricing_version = 9;
+  double points          = 10; // 计价后落定的点数（计价前为空）
+
+  // ===== 上下文 =====
+  string request_id   = 11;
+  Timestamp occurred_at = 12;
+  string trace_id     = 13;
+
+  // ===== 完整性（私有云用）=====
+  string prev_hash    = 14;
+  string this_hash    = 15;
+  uint64 monotonic_seq= 16;  // TPM 锚定序号
+}
+</code></pre>
+
+<p>同一个 UsageEvent 贯穿全程：①计量产出（points 为空）→ ③计价填入 points → ④计费引用它扣减 → ⑤结算聚合它 → ⑥对账校验它。一条数据，六段复用，<strong>不存在"计量数据"和"计费数据"两份会漂移的副本</strong>。</p>
+
+<h2 id="i4">I.4 ①计量层：采集 / 去重 / 聚合</h2>
+
+<ul>
+<li><strong>采集</strong>：来源统一为附录 H 的三档（SDK / Sidecar / 中间件），产出 UsageEvent。</li>
+<li><strong>去重</strong>：以 <code>event_id</code> 为幂等键，重试 / 网络重发不重复计量。公有云用 Redis SETNX 窗口去重，私有云用 WAL 的 request_id 索引。</li>
+<li><strong>聚合</strong>：高频小额场景（如逐 token 计量）按"租户+meter+时间窗"预聚合再入计价，降低下游压力。聚合是可选优化，不改变语义。</li>
+</ul>
+
+<pre><code>原始调用 → UsageEvent(raw) → [去重网关] → [可选聚合窗口] → 入②归一
+                                  │
+                                  └─ 已见过的 event_id 直接丢弃
+</code></pre>
+
+<h2 id="i5">I.5 ②归一层：原始单位 → 标准计量单位</h2>
+
+<p>不同产线的 raw_unit 五花八门，归一层把它们映射到<strong>标准计量单位（SMU, Standard Metering Unit）</strong>，让后续计价只面对有限几种量纲：</p>
+
+<table>
+<thead><tr><th>产线 raw_unit</th><th>标准计量单位 SMU</th><th>归一规则</th></tr></thead>
+<tbody>
+<tr><td>token</td><td>kilotoken</td><td>raw / 1000</td></tr>
+<tr><td>message（短信）</td><td>message（长短信按 67 字拆分计 N 条）</td><td>ceil(len / seg_size)</td></tr>
+<tr><td>second（音频）</td><td>second</td><td>1:1</td></tr>
+<tr><td>image</td><td>image-unit（按分辨率档加权）</td><td>base × resolution_factor × steps</td></tr>
+<tr><td>request（检索）</td><td>call</td><td>1:1</td></tr>
+</tbody>
+</table>
+
+<p>归一同时做<strong>维度补全</strong>：把 region、model、edition 等补进 <code>dimensions</code>，供计价做分档。归一规则是纯函数，公私共享、跑契约测试。</p>
+
+<h2 id="i6">I.6 ③计价层：统一计价引擎</h2>
+
+<p>整个平台<strong>只有一个计价引擎</strong>，输入 (SMU, dimensions, pricing_version)，输出 points。公私云的差异仅在"价目表从哪来"（附录 G 的 <code>PricingSource</code> 端口）：</p>
+
+<pre><code>points = PricingEngine.calc(
+    smu_value,            // 标准计量单位数量
+    dimensions,           // 分档维度
+    plan = PricingSource.load(tenant, pricing_version)
+)
+// 公有云：PricingSource = DB 表（可热更、可灰度）
+// 私有云：PricingSource = License 内嵌价目表（签名锁定、不可改）
+</code></pre>
+
+<p>计价引擎本身是公私<strong>逐字节相同</strong>的纯函数——这保证了"同样的用量，在公有云和私有云算出同样的点数"，这是统一计费可信的核心。计价结果（points + pricing_version）回填进 UsageEvent，从此点数就是不可变的既定事实。</p>
+
+<h2 id="i7">I.7 ④计费层：点数 → 余额扣减</h2>
+
+<p>计费层就是附录 A 的 hold/commit/cancel 状态机 + 附录 G 的 <code>QuotaStore</code> 端口。无论公私，<strong>计费引擎看到的只是点数</strong>，不关心这点数来自短信还是 token——这正是点数抽象的价值。</p>
+
+<pre><code>UsageEvent(points=712) ──► Charging
+                              │ QuotaStore.Commit
+              ┌───────────────┴───────────────┐
+         公有云 PgQuotaStore            私有云 LocalQuotaStore
+         Redis+PG 实时扣减               BoltDB+WAL 本地扣减
+</code></pre>
+
+<h2 id="i8">I.8 ⑤结算层：点数 → 账单</h2>
+
+<ul>
+<li><strong>周期汇总</strong>：按租户 × 产线 × meter × 账期聚合点数，生成结算单。</li>
+<li><strong>成本分摊</strong>：基于 dimensions（如部门 Header）做内部分账。</li>
+<li><strong>点数 ↔ 钱</strong>：仅在结算层做最终换算（点数单价由套餐决定），前面全程用点数避免汇率/税率污染。</li>
+<li><strong>公私一致</strong>：公有云实时出账；私有云在线/半离线周期出账；纯许可模式不出账（许可即收据，见附录 E）。</li>
+</ul>
+
+<h2 id="i9">I.9 ⑥对账层：计量与计费一致性闭环</h2>
+
+<p>"统一"最终要靠对账兜底——证明<strong>计量出来的</strong>和<strong>计费扣掉的</strong>分毫不差：</p>
+
+<pre><code>对账等式（任意账期、任意租户均须成立）：
+  Σ UsageEvent.points (计量侧产出)
+    == Σ QuotaStore 扣减 (计费侧)
+    == Σ Settlement 出账点数 (结算侧)
+
+三方不等 → 触发差异定位：
+  按 meter / 产线 / 时间窗逐层下钻，定位到具体 event_id
+</code></pre>
+
+<table>
+<thead><tr><th>形态</th><th>对账方式</th></tr></thead>
+<tbody>
+<tr><td>公有云</td><td>实时流对账 + 每日批对账（计量流水 vs 余额变更 vs 账单）</td></tr>
+<tr><td>私有云在线/半离线</td><td>上报的 UsageEvent vs 中心结算，周期对账</td></tr>
+<tr><td>U 盘气隙</td><td>导出包内的 Merkle root vs 中心导入后重算</td></tr>
+<tr><td>纯许可</td><td>客户单方对账（本地计量 vs 本地扣减），厂商不参与（附录 E.6）</td></tr>
+</tbody>
+</table>
+
+<h2 id="i10">I.10 实时与批量的统一</h2>
+
+<p>计量计费天然有"实时扣费"和"批量结算/分析"两种诉求。不应该为它们建两套管道，而用<strong>同一份 UsageEvent 流，两种消费者</strong>（Kappa 架构）：</p>
+
+<pre><code>                        ┌──► 实时消费者：Charging（扣余额、限额拦截）
+UsageEvent 流 (统一日志) ─┤
+                        └──► 批量消费者：Settlement / 数仓 / BI 分析
+</code></pre>
+
+<ul>
+<li><strong>公有云</strong>：统一日志 = Kafka；实时扣费走流处理，结算/分析走数仓。</li>
+<li><strong>私有云</strong>：统一日志 = 本地 WAL；实时扣费走内存 actor，结算走 WAL 回放聚合。</li>
+<li>两种消费者读<strong>同一份事件</strong>，不会出现"实时扣的"和"批量算的"对不上——因为它们本就是同一条数据。</li>
+</ul>
+
+<h2 id="i11">I.11 多维聚合：一份数据，多种用途</h2>
+
+<p>统一 UsageEvent 带齐了维度（tenant / product_line / meter / dimensions / time），一次落账即可支撑多种视图，无需各业务重复埋点：</p>
+
+<table>
+<thead><tr><th>聚合维度</th><th>用途</th></tr></thead>
+<tbody>
+<tr><td>tenant × 账期</td><td>客户账单</td></tr>
+<tr><td>product_line × 账期</td><td>产线收入 / 成本归因</td></tr>
+<tr><td>meter × 时间窗</td><td>容量规划、异常用量告警</td></tr>
+<tr><td>dimensions.dept × 账期</td><td>客户内部分摊（私有云常见）</td></tr>
+<tr><td>region × meter</td><td>区域定价优化</td></tr>
+<tr><td>tenant × meter（环比）</td><td>用量突增风控、欺诈检测</td></tr>
+</tbody>
+</table>
+
+<h2 id="i12">I.12 计量计费一致性保障</h2>
+
+<table>
+<thead><tr><th>风险</th><th>保障手段</th></tr></thead>
+<tbody>
+<tr><td>计量丢失（用了没算）</td><td>SDK/Sidecar 强制路径 + 计量 lint 检查无免费后门（附录 H.9）</td></tr>
+<tr><td>重复计量（算两次）</td><td>event_id 全局幂等去重</td></tr>
+<tr><td>计量与计费漂移</td><td>同一 UsageEvent 贯穿全程，无两份副本</td></tr>
+<tr><td>计价口径不一致</td><td>单一计价引擎纯函数，公私逐字节相同</td></tr>
+<tr><td>历史不可重算</td><td>pricing_version 落在每条事件上，可按任意版本重算</td></tr>
+<tr><td>私有云篡改</td><td>this_hash / prev_hash / monotonic_seq（附录 B、F）</td></tr>
+<tr><td>账期边界用量归属错</td><td>以 occurred_at 而非入账时间划账期</td></tr>
+</tbody>
+</table>
+
+<h2 id="i13">I.13 统一管道在五种形态下的退化</h2>
+
+<p>同一条六段管道，末端按形态适配，<strong>段的语义不变、只换实现</strong>：</p>
+
+<table>
+<thead><tr><th>段</th><th>公有云</th><th>私有云在线</th><th>半离线</th><th>U盘气隙</th><th>纯许可</th></tr></thead>
+<tbody>
+<tr><td>①计量</td><td>SDK/Sidecar</td><td>同左</td><td>同左</td><td>同左</td><td>同左</td></tr>
+<tr><td>②归一</td><td colspan="5" style="text-align:center">完全相同（纯函数）</td></tr>
+<tr><td>③计价</td><td>DB 价目表</td><td>中心下发表</td><td>License 内嵌</td><td>License 内嵌</td><td>License 内嵌</td></tr>
+<tr><td>④计费</td><td>Redis+PG</td><td>Redis+PG</td><td>WAL</td><td>WAL+TPM</td><td>WAL+TPM</td></tr>
+<tr><td>⑤结算</td><td>实时出账</td><td>周期上报出账</td><td>Bundle 出账</td><td>导入后出账</td><td>不出账</td></tr>
+<tr><td>⑥对账</td><td>流+批对账</td><td>周期对账</td><td>周期对账</td><td>Merkle 对账</td><td>客户单方</td></tr>
+</tbody>
+</table>
+
+<p>②归一、③计价的核心逻辑完全相同——这正是"统一计量计费"落地的硬指标：<strong>同一笔用量，在任何形态下归一出同样的 SMU、计价出同样的点数</strong>，差异只在数据存哪、报给谁。</p>
+
+<h2 id="i14">I.14 一句话总结</h2>
+
+<p>统一计量计费的本质是<strong>"一个事件模型、一条管道、一个计价引擎"</strong>：所有产线的异构用量归一成同一个 UsageEvent，流经同一条"计量→归一→计价→计费→结算→对账"六段管道，由同一个纯函数计价引擎折算成点数。公私云、在线离线只在管道末端换实现，语义恒定——于是任意来源、任意形态的用量都能算得一致、对得上账、合得了并。</p>
+
 </main>
 <script>
 (function () {
