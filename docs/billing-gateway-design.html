@@ -1,0 +1,2993 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>计费网关设计文档</title>
+<style>
+:root {
+  --fg: #1f2328;
+  --muted: #57606a;
+  --bg: #ffffff;
+  --bg-soft: #f6f8fa;
+  --border: #d0d7de;
+  --accent: #0969da;
+  --code-bg: #f6f8fa;
+  --pre-bg: #0d1117;
+  --pre-fg: #e6edf3;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+               "Hiragino Sans GB", "Microsoft YaHei", Roboto, "Helvetica Neue",
+               Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.7;
+  color: var(--fg);
+  background: var(--bg);
+}
+.container {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 48px 32px 96px;
+}
+h1, h2, h3, h4, h5, h6 {
+  margin-top: 1.8em;
+  margin-bottom: 0.6em;
+  line-height: 1.3;
+  font-weight: 600;
+}
+h1 {
+  font-size: 2em;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.3em;
+}
+h2 {
+  font-size: 1.5em;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.3em;
+}
+h3 { font-size: 1.25em; }
+h4 { font-size: 1.05em; color: var(--muted); }
+p { margin: 0.8em 0; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 2.4em 0;
+}
+ul, ol { padding-left: 1.6em; }
+li { margin: 0.25em 0; }
+blockquote {
+  margin: 1em 0;
+  padding: 0.6em 1em;
+  color: var(--muted);
+  border-left: 4px solid var(--border);
+  background: var(--bg-soft);
+}
+code {
+  font-family: "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.92em;
+  background: var(--code-bg);
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+}
+pre {
+  background: var(--pre-bg);
+  color: var(--pre-fg);
+  padding: 1em 1.2em;
+  border-radius: 8px;
+  overflow-x: auto;
+  line-height: 1.55;
+}
+pre code {
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  font-size: 0.88em;
+}
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1em 0;
+  display: block;
+  overflow-x: auto;
+}
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.8em;
+  text-align: left;
+  vertical-align: top;
+}
+th {
+  background: var(--bg-soft);
+  font-weight: 600;
+}
+tr:nth-child(2n) td { background: #fafbfc; }
+strong { color: #1f2328; }
+.toc {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1em 1.4em;
+  margin: 1.5em 0 2.4em;
+}
+.toc-title {
+  font-weight: 600;
+  margin-bottom: 0.4em;
+  font-size: 0.95em;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.toc ul { padding-left: 1.2em; margin: 0.2em 0; }
+.toc > ul { padding-left: 0; list-style: none; }
+.toc > ul > li > a { font-weight: 600; }
+@media (max-width: 720px) {
+  .container { padding: 24px 16px 64px; }
+  body { font-size: 15px; }
+  h1 { font-size: 1.6em; }
+  h2 { font-size: 1.3em; }
+}
+</style>
+</head>
+<body>
+<main class="container">
+<h1 id="saas">计费网关设计文档（公有云 / 私有云 SaaS 双模式）</h1>
+<h2 id="1">1. 背景与目标</h2>
+<p>平台对外提供多种可计费能力（短信、LLM Token、语音、图像、知识库检索等），既要支持<strong>公有云多租户 SaaS</strong>，也要支持<strong>私有云独立部署</strong>（含完全断网/气隙环境）。</p>
+<p>设计目标：</p>
+<ol>
+<li><strong>统一计量、统一计费</strong>：所有可计费动作最终归一到「<strong>点数（Point）</strong>」这一抽象单位。</li>
+<li><strong>解耦计量与定价</strong>：业务侧只上报"用了多少原始单位"，由计费网关负责"折算成多少点数"。</li>
+<li><strong>公有云在线扣费、私有云离线核销</strong>两种模式共用同一套数据模型，便于私转公或混合部署。</li>
+<li><strong>不可篡改、可审计、可对账</strong>：断网环境也能在恢复连接后完成完整对账。</li>
+</ol>
+<hr />
+<h2 id="2">2. 核心概念</h2>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Point（点数）</td>
+<td>平台内部统一计价单位，1 点 = X 元（X 由套餐决定）</td>
+</tr>
+<tr>
+<td>Meter（计量项）</td>
+<td>一种可计费的原子能力，例如 <code>sms.cn</code>、<code>llm.gpt4.input_token</code>、<code>tts.zh</code></td>
+</tr>
+<tr>
+<td>Pricing Plan（计费方案）</td>
+<td>Meter → Point 的换算规则，可按租户/版本/时间维度生效</td>
+</tr>
+<tr>
+<td>Quota（额度）</td>
+<td>租户当前可用的点数余额（公有云）或 License 内剩余点数（私有云）</td>
+</tr>
+<tr>
+<td>Usage Record（用量记录）</td>
+<td>一次调用产生的原始计量数据，签名后落账</td>
+</tr>
+<tr>
+<td>Settlement（结算单）</td>
+<td>一段周期内按点数汇总的账单</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="3">3. 总体架构</h2>
+<pre><code>       ┌───────────────────────────────────────────────────────────┐
+       │                       业务网关层                          │
+       │   (API Gateway / SDK / OpenAPI - 短信、LLM、TTS 等)       │
+       └──────────────────────┬────────────────────────────────────┘
+                              │ 1. 预检 (Pre-check)
+                              │ 2. 异步上报 (Async report)
+                              ▼
+       ┌───────────────────────────────────────────────────────────┐
+       │                     计费网关 (Billing GW)                 │
+       │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌───────────┐  │
+       │  │ 配额服务 │  │ 计量服务 │  │ 计价引擎 │  │ 结算&amp;账单 │  │
+       │  │  Quota   │  │  Meter   │  │  Pricer  │  │ Settlement│  │
+       │  └──────────┘  └──────────┘  └──────────┘  └───────────┘  │
+       │                          │                                │
+       │                          ▼                                │
+       │                  ┌───────────────┐                        │
+       │                  │  事件日志(WAL)│  ← 不可变追加           │
+       │                  └───────────────┘                        │
+       └──────────────────────┬────────────────────────────────────┘
+                              │
+              ┌───────────────┴───────────────┐
+              ▼                               ▼
+      公有云：实时余额扣减           私有云：License 离线核销
+      (强一致 / Redis + DB)         (本地累计 + 周期上报/导出)
+</code></pre>
+<hr />
+<h2 id="4-point">4. 点数（Point）统一计费模型</h2>
+<h3 id="41">4.1 为什么必须用点数</h3>
+<ul>
+<li>业务侧的原始单位差异巨大：短信按"条"，LLM 按"Token"，语音按"秒"，图像按"张/分辨率"。</li>
+<li>直接用"元"会因汇率、税率、套餐折扣等导致计费逻辑爆炸。</li>
+<li>点数作为中间抽象单位：</li>
+<li><strong>业务方只关心 Meter</strong>；</li>
+<li><strong>商务方只关心点数 ↔ 钱的换算</strong>；</li>
+<li><strong>客户只关心剩余点数</strong>。</li>
+</ul>
+<h3 id="42-pricing-rule">4.2 换算规则（Pricing Rule）</h3>
+<p>每个 Meter 定义一个换算函数，统一形式：</p>
+<pre><code>points = ceil( (raw_usage / unit) * rate * multiplier )
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>raw_usage</code></td>
+<td>原始计量值（条数、token 数、秒数等）</td>
+</tr>
+<tr>
+<td><code>unit</code></td>
+<td>计费基本单位（如 1000 tokens 为一个计费单元）</td>
+</tr>
+<tr>
+<td><code>rate</code></td>
+<td>每单位消耗多少点数</td>
+</tr>
+<tr>
+<td><code>multiplier</code></td>
+<td>租户/版本/促销系数</td>
+</tr>
+<tr>
+<td><code>ceil</code></td>
+<td>取整策略（向上取整，避免零计费薅羊毛）</td>
+</tr>
+</tbody>
+</table>
+<h4 id="_1">示例</h4>
+<table>
+<thead>
+<tr>
+<th>Meter</th>
+<th>原始单位</th>
+<th>计费规则</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>sms.cn.normal</code></td>
+<td>1 条</td>
+<td>1 点 / 条</td>
+<td>国内普通短信</td>
+</tr>
+<tr>
+<td><code>sms.cn.marketing</code></td>
+<td>1 条</td>
+<td>2 点 / 条</td>
+<td>营销短信加价</td>
+</tr>
+<tr>
+<td><code>sms.intl.&lt;region&gt;</code></td>
+<td>1 条</td>
+<td>5~30 点 / 条</td>
+<td>按地区分档</td>
+</tr>
+<tr>
+<td><code>llm.gpt4o.input</code></td>
+<td>1 token</td>
+<td>0.3 点 / 1K tokens</td>
+<td>长 prompt 友好</td>
+</tr>
+<tr>
+<td><code>llm.gpt4o.output</code></td>
+<td>1 token</td>
+<td>1.2 点 / 1K tokens</td>
+<td>输出更贵</td>
+</tr>
+<tr>
+<td><code>llm.claude.sonnet.input</code></td>
+<td>1 token</td>
+<td>0.3 点 / 1K tokens</td>
+<td></td>
+</tr>
+<tr>
+<td><code>llm.claude.sonnet.output</code></td>
+<td>1 token</td>
+<td>1.5 点 / 1K tokens</td>
+<td></td>
+</tr>
+<tr>
+<td><code>embedding.text</code></td>
+<td>1 token</td>
+<td>0.02 点 / 1K tokens</td>
+<td></td>
+</tr>
+<tr>
+<td><code>tts.zh</code></td>
+<td>1 秒</td>
+<td>0.5 点 / 秒</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>关键设计</strong>：换算表通过 <strong>Pricing Plan 版本号</strong>管理，所有 Usage Record 都要带 <code>pricing_version</code>，保证历史账单可重算、可追溯。</p>
+</blockquote>
+<h3 id="43">4.3 一次调用的计费流水</h3>
+<pre><code>1. 用户调用 /v1/chat/completions
+2. 网关 Pre-check：估算 max_points（input_tokens 已知，output 按 max_tokens 上界估算）
+                  → 检查 Quota.available &gt;= max_points，否则 402
+                  → 冻结 max_points (hold)
+3. 业务执行，得到真实 output_tokens
+4. 计算 actual_points = price(input) + price(output)
+5. Release hold，扣减 actual_points
+6. 写入 Usage Record（含签名）→ WAL
+7. 异步聚合到 Settlement
+</code></pre>
+<hr />
+<h2 id="5">5. 公有云模式</h2>
+<h3 id="51">5.1 关键特性</h3>
+<ul>
+<li><strong>强一致余额</strong>：Redis（热）+ MySQL/PG（冷）双写，账户级行锁防并发超扣。</li>
+<li><strong>预扣 + 冲正</strong>：高并发场景下用 hold/commit/cancel 三段式，避免回滚噪声。</li>
+<li><strong>实时充值</strong>：对接支付/订单系统，充值后即时入账。</li>
+<li><strong>超额策略</strong>：可配置硬拒绝、透支额度、欠费降级。</li>
+</ul>
+<h3 id="52">5.2 数据流</h3>
+<pre><code>SDK ─► API GW ─► Billing GW.Quota (check + hold)
+                       │
+                       ▼
+                  业务执行
+                       │
+                       ▼
+              Billing GW.Meter.commit
+                       │
+              ┌────────┴────────┐
+              ▼                 ▼
+         Quota.deduct     UsageRecord(WAL) ─► Kafka ─► 数仓/账单
+</code></pre>
+<hr />
+<h2 id="6">6. 私有云模式（重点：含完全断网场景）</h2>
+<p>私有云的核心矛盾：<strong>没有中心服务可以实时扣费</strong>，但仍要做到：
+- 客户不能无限白嫖（必须有授权上限）；
+- 厂商最终能拿到准确用量做结算；
+- 客户能自审计、不被"算多了"。</p>
+<h3 id="61">6.1 三档部署形态</h3>
+<table>
+<thead>
+<tr>
+<th>形态</th>
+<th>网络</th>
+<th>计费方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>A. 在线私有云</strong></td>
+<td>出站可达计费中心</td>
+<td>周期性（如每分钟）异步上报，准实时扣费</td>
+</tr>
+<tr>
+<td><strong>B. 半离线私有云</strong></td>
+<td>仅允许定时白名单出站</td>
+<td>每日/每周打包上传 Usage Bundle</td>
+</tr>
+<tr>
+<td><strong>C. 气隙私有云</strong></td>
+<td>完全物理隔离</td>
+<td>License 预付点数 + 手工导出/导入对账包</td>
+</tr>
+</tbody>
+</table>
+<h3 id="62-license">6.2 License 文件（所有私有云形态的基石）</h3>
+<p>License 是一个<strong>离线签名文件</strong>，由计费中心用私钥签发，私有云用公钥校验：</p>
+<pre><code class="language-jsonc">{
+  &quot;license_id&quot;: &quot;LIC-2026-0001&quot;,
+  &quot;tenant&quot;: &quot;acme-corp&quot;,
+  &quot;issued_at&quot;: &quot;2026-05-18T00:00:00Z&quot;,
+  &quot;valid_from&quot;: &quot;2026-05-18&quot;,
+  &quot;valid_until&quot;: &quot;2027-05-17&quot;,
+  &quot;edition&quot;: &quot;enterprise&quot;,
+  &quot;quota&quot;: {
+    &quot;total_points&quot;: 10000000,           // 本期授权总点数
+    &quot;reset_policy&quot;: &quot;none&quot;,             // none | monthly | yearly
+    &quot;overdraft_points&quot;: 0               // 允许透支
+  },
+  &quot;meters_allowed&quot;: [&quot;sms.*&quot;, &quot;llm.*&quot;, &quot;tts.zh&quot;],
+  &quot;pricing_version&quot;: &quot;v2026.05&quot;,        // 锁定的计价表版本
+  &quot;reporting&quot;: {
+    &quot;mode&quot;: &quot;online | bundle | airgap&quot;,
+    &quot;endpoint&quot;: &quot;https://billing.example.com/v1/usage&quot;,
+    &quot;interval_sec&quot;: 3600
+  },
+  &quot;hardware_fingerprint&quot;: &quot;sha256:...&quot;, // 防止 License 跨机迁移
+  &quot;signature&quot;: &quot;base64(RSA/Ed25519)&quot;
+}
+</code></pre>
+<blockquote>
+<p><strong>要点</strong>：私有云内的计费网关<strong>只信任 License 文件</strong>，所有扣费都从 License 内的 <code>total_points</code> 余额扣减。</p>
+</blockquote>
+<h3 id="63">6.3 私有云内部数据流</h3>
+<pre><code>        ┌────────────────────────────────────────────────┐
+        │             私有云本地 Billing GW              │
+        │                                                │
+        │  License Loader ──► LocalQuotaStore (BadgerDB) │
+        │                          ▲                     │
+        │  业务请求 ───► Meter ────┘                     │
+        │                  │                             │
+        │                  ▼                             │
+        │           UsageRecord (本地 WAL，仅追加)       │
+        │                  │                             │
+        │                  ▼                             │
+        │   ┌─────────────────────────────┐              │
+        │   │  Reporter (按形态切换)      │              │
+        │   │  - online: HTTPS 上报       │              │
+        │   │  - bundle: 打包 + 签名导出  │              │
+        │   │  - airgap: 手工导出 .ubp    │              │
+        │   └─────────────────────────────┘              │
+        └────────────────────────────────────────────────┘
+</code></pre>
+<h3 id="64">6.4 不可篡改的本地账本</h3>
+<ul>
+<li><strong>WAL 仅追加</strong>：每条 UsageRecord 落盘后立即 fsync，按小时滚动文件。</li>
+<li><strong>Merkle Hash Chain</strong>：每条记录 <code>hash_i = H(hash_{i-1} || record_i)</code>，每日生成 Daily Root Hash。</li>
+<li><strong>TPM/HSM 可选</strong>：每日 Root Hash 用本地 TPM 签名，防止运维人员篡改账本。</li>
+<li><strong>客户可审计</strong>：客户可独立运行 <code>audit-cli</code> 校验本地账本完整性。</li>
+</ul>
+<h3 id="65-c">6.5 气隙环境（C 类）对账流程</h3>
+<pre><code>[私有云侧]
+1. billing-cli export --from 2026-05-01 --to 2026-05-31 \
+       --out usage-2026-05.ubp
+   → 产物：Usage Bundle Package (.ubp)
+       - 加密 (AES-256-GCM, 密钥来自 License)
+       - 含 Merkle Root + TPM 签名
+       - 含设备指纹
+
+2. 客户用 U 盘把 .ubp 带出隔离区
+
+[计费中心侧]
+3. billing-admin import usage-2026-05.ubp
+   → 校验签名/指纹/Merkle 链 → 入库
+   → 生成结算单
+   → 生成 License Refresh File（新一期点数 + 已确认的扣减游标）
+
+4. 客户把 License Refresh File 带回隔离区
+
+[私有云侧]
+5. billing-cli license refresh license-refresh.lrf
+   → 校验签名 → 更新 LocalQuotaStore
+   → 标记已对账区间为&quot;已结算&quot;，从 WAL 截断
+</code></pre>
+<h3 id="66">6.6 防作弊与时钟保护</h3>
+<ul>
+<li><strong>设备指纹</strong>：CPU / 主板 / 网卡 / 部署 UUID 组合，License 绑定后不可迁移。</li>
+<li><strong>单调时钟</strong>：本地维护"曾经见过的最大时间戳"，防止运维人员回拨系统时间重复消费。</li>
+<li><strong>License 反重放</strong>：每张 License 有 <code>nonce</code>，刷新文件按序号递增，旧文件无法重新激活。</li>
+<li><strong>业务侧 Pre-check 必须经过本地 Quota</strong>：禁止业务模块绕过计费网关直连下游。</li>
+</ul>
+<hr />
+<h2 id="7">7. 数据模型（核心表）</h2>
+<pre><code class="language-sql">-- 计量项注册表
+CREATE TABLE meters (
+  code           VARCHAR(64) PRIMARY KEY,    -- e.g. llm.gpt4o.input
+  display_name   VARCHAR(128),
+  raw_unit       VARCHAR(32),                -- token / sms / second
+  category       VARCHAR(32)                 -- llm / sms / tts ...
+);
+
+-- 计价方案（版本化）
+CREATE TABLE pricing_plans (
+  id             BIGINT PRIMARY KEY,
+  version        VARCHAR(32),                -- v2026.05
+  meter_code     VARCHAR(64),
+  unit_size      INT,                        -- 1000 (per 1K tokens)
+  points_per_unit DECIMAL(18,6),
+  effective_from TIMESTAMP,
+  effective_to   TIMESTAMP NULL
+);
+
+-- 租户配额（公有云：动态变化；私有云：等同 License 镜像）
+CREATE TABLE quotas (
+  tenant_id      VARCHAR(64) PRIMARY KEY,
+  total_points   DECIMAL(20,4),
+  used_points    DECIMAL(20,4),
+  held_points    DECIMAL(20,4),
+  overdraft      DECIMAL(20,4),
+  updated_at     TIMESTAMP
+);
+
+-- 用量流水（核心，最终都会同步到中心）
+CREATE TABLE usage_records (
+  id             UUID PRIMARY KEY,
+  tenant_id      VARCHAR(64),
+  meter_code     VARCHAR(64),
+  raw_usage      DECIMAL(20,4),
+  points         DECIMAL(20,4),
+  pricing_version VARCHAR(32),
+  request_id     VARCHAR(64),
+  occurred_at    TIMESTAMP,
+  prev_hash      CHAR(64),
+  this_hash      CHAR(64),
+  deployment_id  VARCHAR(64),                -- 私有云实例标识
+  INDEX (tenant_id, occurred_at)
+);
+</code></pre>
+<hr />
+<h2 id="8">8. 接口草案</h2>
+<h3 id="81">8.1 业务侧上报（内部）</h3>
+<pre><code class="language-http">POST /internal/v1/usage/commit
+{
+  &quot;tenant_id&quot;: &quot;acme&quot;,
+  &quot;request_id&quot;: &quot;req-abc&quot;,
+  &quot;items&quot;: [
+    {&quot;meter&quot;: &quot;llm.gpt4o.input&quot;,  &quot;raw&quot;: 1532},
+    {&quot;meter&quot;: &quot;llm.gpt4o.output&quot;, &quot;raw&quot;:  481}
+  ],
+  &quot;hold_id&quot;: &quot;h-xxxx&quot;           // pre-check 阶段拿到
+}
+→ 200 { &quot;points_charged&quot;: 712, &quot;balance&quot;: 9982341 }
+</code></pre>
+<h3 id="82">8.2 私有云 ↔ 计费中心</h3>
+<pre><code class="language-http">POST /v1/license/issue          # 签发 / 续期
+POST /v1/usage/bundle           # 上传打包用量
+GET  /v1/license/refresh        # 拉取刷新文件
+</code></pre>
+<p>气隙模式下，以上接口均通过 <code>.ubp</code> / <code>.lrf</code> 文件离线流转。</p>
+<hr />
+<h2 id="9">9. 失败处理与降级</h2>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>公有云策略</th>
+<th>私有云策略</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>计费网关短暂不可达</td>
+<td>业务侧本地缓存 hold，恢复后 commit；超时拒绝</td>
+<td>本地 WAL 持续写入，不受中心可达性影响</td>
+</tr>
+<tr>
+<td>余额不足</td>
+<td>返回 402 + 升级提示</td>
+<td>阻断 + License 即将耗尽预警</td>
+</tr>
+<tr>
+<td>时钟漂移 &gt; 阈值</td>
+<td>NTP 强制校准；记录但不阻断</td>
+<td>阻断扣费，要求人工介入</td>
+</tr>
+<tr>
+<td>License 过期</td>
+<td>N/A</td>
+<td>进入 7 天宽限期（只读+预警），之后全量阻断</td>
+</tr>
+<tr>
+<td>WAL 损坏</td>
+<td>从 binlog 回放</td>
+<td>启动失败，需从最近 daily root 恢复，差量重算</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="10">10. 安全要点</h2>
+<ol>
+<li><strong>签名密钥</strong>：License 与 Refresh 文件使用 Ed25519，私钥仅在计费中心 HSM 内。</li>
+<li><strong>传输</strong>：在线模式 mTLS，离线模式包内 AES-256-GCM + 完整性 MAC。</li>
+<li><strong>最小权限</strong>：私有云内 Billing GW 服务账户对 WAL 目录只增不删（chattr +a）。</li>
+<li><strong>审计接口对客户开放</strong>：客户可在私有云内独立验证账本，建立信任。</li>
+<li><strong>隐私</strong>：UsageRecord 默认不含业务原文，仅记录 meter + 数量 + request_id 摘要。</li>
+</ol>
+<hr />
+<h2 id="11-tbd">11. 后续工作 (TBD)</h2>
+<ul>
+<li>[ ] Pricing Plan 的灰度发布与回滚机制</li>
+<li>[ ] 多币种结算与汇率快照</li>
+<li>[ ] 大客户私有云 → 公有云联邦计费（混合云用量合并账单）</li>
+<li>[ ] 与 OpenTelemetry Metrics 对接，提供消费可视化大盘</li>
+<li>[ ] License 自助续费门户（含离线签发 + 邮寄/U 盘交付 SOP）</li>
+</ul>
+<hr />
+<h1 id="ahold-commit-cancel">附录 A：Hold / Commit / Cancel 状态机详解</h1>
+<h2 id="a1">A.1 为什么需要三段式</h2>
+<p>LLM 类调用最难计费的地方在于：<strong>调用开始时不知道最终消耗多少</strong>（output_tokens 是结果决定的）。如果先调用后扣费，并发场景下就会出现"100 个请求同时只剩 50 点"的超扣。</p>
+<p>三段式（Two-Phase Charging）解决：</p>
+<pre><code>Pre-check ──hold──► 业务执行 ──commit(actual)──► 真实扣费
+                       │
+                       └──cancel──► 释放预扣（失败/超时）
+</code></pre>
+<h2 id="a2">A.2 状态机定义</h2>
+<pre><code>              ┌─────────────┐
+              │   INITIAL   │
+              └──────┬──────┘
+            hold(max_points)
+                    │  余额不足 → REJECTED
+                    ▼
+              ┌─────────────┐
+   ┌──────────┤    HELD     ├──────────┐
+   │          └──────┬──────┘          │
+commit(actual)       │ TTL 超时         cancel
+   │            (e.g. 5 min)            │
+   ▼                ▼                   ▼
+┌─────────┐   ┌──────────┐        ┌──────────┐
+│COMMITTED│   │  EXPIRED │        │ CANCELED │
+└─────────┘   └─────┬────┘        └──────────┘
+                    │ 自动 cancel
+                    ▼
+                ┌──────────┐
+                │ CANCELED │
+                └──────────┘
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>含义</th>
+<th>影响余额字段</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>HELD</code></td>
+<td>预扣中，可用余额减少但 used 未变</td>
+<td><code>held_points += max</code></td>
+</tr>
+<tr>
+<td><code>COMMITTED</code></td>
+<td>真实扣费完成</td>
+<td><code>held_points -= max; used_points += actual</code></td>
+</tr>
+<tr>
+<td><code>CANCELED</code></td>
+<td>主动取消或失败</td>
+<td><code>held_points -= max</code></td>
+</tr>
+<tr>
+<td><code>EXPIRED</code></td>
+<td>TTL 到期被回收</td>
+<td>同 CANCELED + 触发告警</td>
+</tr>
+<tr>
+<td><code>REJECTED</code></td>
+<td>hold 阶段就被拒（余额不足/Meter 未授权）</td>
+<td>无影响</td>
+</tr>
+</tbody>
+</table>
+<h2 id="a3">A.3 余额计算公式</h2>
+<pre><code>available_points = total_points - used_points - held_points + overdraft_points
+</code></pre>
+<p>所有读取都走该公式，hold 阶段对客户表现为"已扣"，避免并发请求看到虚高余额。</p>
+<h2 id="a4-hold">A.4 hold 配额估算</h2>
+<table>
+<thead>
+<tr>
+<th>Meter 类型</th>
+<th>max_points 估算策略</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SMS</td>
+<td>精确：条数 × 单价（无歧义）</td>
+</tr>
+<tr>
+<td>LLM input</td>
+<td>精确：tokenizer 计算 prompt token</td>
+</tr>
+<tr>
+<td>LLM output</td>
+<td>悲观：按请求中 <code>max_tokens</code> 上界计算</td>
+</tr>
+<tr>
+<td>TTS / 语音</td>
+<td>按上游返回的预估时长 + 20% 缓冲</td>
+</tr>
+<tr>
+<td>流式调用</td>
+<td>按 chunk 累加多次小额 hold（见 A.7）</td>
+</tr>
+</tbody>
+</table>
+<h2 id="a5-commit">A.5 commit 阶段的差额处理</h2>
+<pre><code>delta = actual - max_held
+if delta &gt; 0:          # 实际比预估多（极少见，需严格防护）
+    if available_points &lt; delta:
+        → 写 OVERDRAFT_EVENT，按策略：
+          (a) 透支允许：扣到负数，标记欠费
+          (b) 透支禁止：返回 commit_partial，业务侧记录差额
+else:                  # 实际小于预估，常见
+    退还 (max_held - actual)
+</code></pre>
+<h2 id="a6">A.6 接口规范</h2>
+<pre><code class="language-http"># 1. 预扣
+POST /internal/v1/hold
+{
+  &quot;tenant_id&quot;: &quot;acme&quot;,
+  &quot;request_id&quot;: &quot;req-abc&quot;,
+  &quot;estimates&quot;: [
+    {&quot;meter&quot;: &quot;llm.gpt4o.input&quot;,  &quot;raw&quot;: 1500},
+    {&quot;meter&quot;: &quot;llm.gpt4o.output&quot;, &quot;raw&quot;: 4000}   // max_tokens
+  ],
+  &quot;ttl_sec&quot;: 300
+}
+→ 200 {
+  &quot;hold_id&quot;: &quot;h-9f3b...&quot;,
+  &quot;held_points&quot;: 5300,
+  &quot;expires_at&quot;: &quot;2026-05-18T08:05:00Z&quot;
+}
+→ 402 {&quot;code&quot;: &quot;INSUFFICIENT_BALANCE&quot;, &quot;available&quot;: 200}
+
+# 2. 真实提交
+POST /internal/v1/commit
+{
+  &quot;hold_id&quot;: &quot;h-9f3b...&quot;,
+  &quot;actuals&quot;: [
+    {&quot;meter&quot;: &quot;llm.gpt4o.input&quot;,  &quot;raw&quot;: 1532},
+    {&quot;meter&quot;: &quot;llm.gpt4o.output&quot;, &quot;raw&quot;:  481}
+  ]
+}
+→ 200 {&quot;charged_points&quot;: 712, &quot;refunded_points&quot;: 4588, &quot;balance&quot;: 9982341}
+
+# 3. 取消
+POST /internal/v1/cancel
+{ &quot;hold_id&quot;: &quot;h-9f3b...&quot;, &quot;reason&quot;: &quot;upstream_5xx&quot; }
+→ 200 {&quot;released_points&quot;: 5300, &quot;balance&quot;: 9987641}
+</code></pre>
+<h2 id="a7-sse-streaming">A.7 流式调用 (SSE / streaming) 适配</h2>
+<pre><code>HELD(burst_1) ──commit──► HELD(burst_2) ──commit──► ... ──finalize
+       │
+   每生成 N 个 token 或每 K 秒滚动一次 hold/commit
+</code></pre>
+<p>策略：
+- 首次 hold 取 <code>min(max_tokens, 512 token)</code> 这种小额度；
+- 每流出一段后 <code>partial_commit</code> 并立即 <code>hold</code> 下一段；
+- 连接断开时已 commit 的不退，正在 hold 的走 cancel。</p>
+<h2 id="a8">A.8 幂等与重试</h2>
+<ul>
+<li><code>hold_id</code> / <code>request_id</code> 均为幂等键，PG 唯一索引强约束。</li>
+<li>重复 commit 同一 hold_id → 返回首次结果，不二次扣费。</li>
+<li>业务侧因网络问题不确定 commit 是否成功 → 用 <code>GET /internal/v1/hold/{id}</code> 查询最终态再决定重放。</li>
+</ul>
+<h2 id="a9">A.9 并发与持久化</h2>
+<ul>
+<li>单租户 hold 用 Redis Lua 脚本保证 <code>check + decr + write</code> 原子。</li>
+<li>Lua 脚本对应记录同步 append 到 PG <code>hold_log</code> 表（异步双写）。</li>
+<li>Redis 故障兜底：降级到 PG 行锁，QPS 下降但不丢账。</li>
+<li>TTL 兜底：Redis ZSET 按 <code>expires_at</code> 排序，单独 reaper 协程每 10s 扫描自动 cancel。</li>
+</ul>
+<hr />
+<h1 id="bmerkle">附录 B：Merkle 哈希链校验细节（私有云不可篡改账本）</h1>
+<h2 id="b1">B.1 目标</h2>
+<p>让客户能够<strong>独立验证</strong>：
+1. 任意一条 UsageRecord 没有被增删改；
+2. 上报给计费中心的 daily root，与本地账本的 daily root 完全一致；
+3. 即便 root 系统管理员，也无法静默删除某条记录而不被发现。</p>
+<h2 id="b2">B.2 数据结构</h2>
+<h3 id="hash-chain">链式哈希（Hash Chain）</h3>
+<p>每条记录在 WAL 中带 <code>prev_hash</code> 与 <code>this_hash</code>：</p>
+<pre><code>record_i = {
+  ...usage fields,
+  prev_hash: hash_{i-1},
+  this_hash: SHA256(canonical_json(usage_fields) || prev_hash)
+}
+</code></pre>
+<p>初始记录 <code>prev_hash = SHA256("genesis|" || deployment_id || license_id)</code>。</p>
+<blockquote>
+<p><strong>canonical_json</strong>：键名按字典序排序、数字定型号、UTF-8 NFC 归一，消除序列化歧义。</p>
+</blockquote>
+<h3 id="merkle">当日 Merkle 树</h3>
+<p>每个 UTC 日凌晨，将当日所有记录的 <code>this_hash</code> 作为叶子，构建标准二叉 Merkle Tree：</p>
+<pre><code>              Root_d (DailyRoot)
+             /         \
+          H(L||R)    H(L||R)
+          /   \       /    \
+        h1   h2     h3     h4   ← this_hash of each usage record
+</code></pre>
+<p>奇数叶子用 <code>H(last || last)</code> 填充（避免引入空值）。</p>
+<h3 id="daily-anchor">Daily Anchor 文件</h3>
+<p>每日生成 <code>anchor-YYYYMMDD.json</code>：</p>
+<pre><code class="language-jsonc">{
+  &quot;deployment_id&quot;: &quot;...&quot;,
+  &quot;date&quot;: &quot;2026-05-18&quot;,
+  &quot;record_count&quot;: 184213,
+  &quot;first_record_id&quot;: &quot;uuid&quot;,
+  &quot;last_record_id&quot;:  &quot;uuid&quot;,
+  &quot;merkle_root&quot;: &quot;sha256:abc...&quot;,
+  &quot;prev_anchor_hash&quot;: &quot;sha256:def...&quot;,   // 跨日链，形成 anchor-of-anchors
+  &quot;signed_by_tpm&quot;: &quot;base64(sig)&quot;,         // 可选：TPM 远程认证
+  &quot;signed_by_billing_key&quot;: &quot;base64(sig)&quot;  // 必选：License 内派生密钥
+}
+</code></pre>
+<h2 id="b3">B.3 写入流程（保证不可篡改）</h2>
+<pre><code>business commit
+     │
+     ▼
+1. 序列化 record（canonical_json）
+2. 在写锁内读取 last_hash → 计算 this_hash
+3. append 到 WAL 段文件 (open with O_APPEND | O_DSYNC)
+4. fsync(fd)
+5. 更新内存 last_hash
+6. 返回成功
+</code></pre>
+<p><strong>关键约束</strong>：
+- WAL 文件使用 <code>chattr +a</code>（ext4 append-only），即便 root 也只能追加；
+- WAL 段按小时滚动，旧段 <code>chattr +i</code>（immutable）；
+- 每日生成 anchor 后，当日所有段文件归档到 <code>archive/</code>，权限改为 0400。</p>
+<h2 id="b4-cli">B.4 客户独立审计 CLI</h2>
+<pre><code class="language-bash">$ billing-cli audit verify --from 2026-05-01 --to 2026-05-18
+
+[OK] 段文件完整性: 432/432 segments, no gap
+[OK] 哈希链连续性: 18,452,317 records, no break
+[OK] Daily anchors:  18 days, all signatures valid
+[OK] 与中心对账: 已结算 12 天，root 完全一致；未结算 6 天，本地 pending
+</code></pre>
+<p>底层执行的事：
+1. 顺序读所有 WAL 段，重算 <code>this_hash</code>，与磁盘记录比对；
+2. 重建每日 Merkle Tree，比对 <code>anchor.merkle_root</code>；
+3. 验证 anchor 跨日链：<code>H(prev_anchor) == anchor.prev_anchor_hash</code>；
+4. （在线/半离线模式）拉取中心侧已确认的 root 列表做交叉验证。</p>
+<h2 id="b5-merkle-proof">B.5 Merkle Proof（针对单条记录）</h2>
+<p>客户对某条具体扣费有疑问时：</p>
+<pre><code class="language-bash">$ billing-cli audit proof --record-id uuid-xxx
+{
+  &quot;record&quot;: {...},
+  &quot;merkle_proof&quot;: [
+    {&quot;position&quot;: &quot;right&quot;, &quot;hash&quot;: &quot;...&quot;},
+    {&quot;position&quot;: &quot;left&quot;,  &quot;hash&quot;: &quot;...&quot;},
+    ...
+  ],
+  &quot;merkle_root&quot;: &quot;sha256:abc...&quot;,
+  &quot;anchor_signature&quot;: &quot;base64(...)&quot;
+}
+</code></pre>
+<p>第三方拿到该 proof，无需访问私有云本地数据，即可证明该记录确实存在于某日账本中。</p>
+<h2 id="b6">B.6 篡改检测场景</h2>
+<table>
+<thead>
+<tr>
+<th>攻击行为</th>
+<th>检测点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>删除某条已写入记录</td>
+<td>下一条 prev_hash 校验失败</td>
+</tr>
+<tr>
+<td>修改 raw_usage 数值</td>
+<td>this_hash 不匹配</td>
+</tr>
+<tr>
+<td>偷偷重排序段文件</td>
+<td>segment 编号 + 起止 record_id 比对失败</td>
+</tr>
+<tr>
+<td>全部重算哈希链</td>
+<td>与 anchor 已签名的 root 对不上</td>
+</tr>
+<tr>
+<td>篡改 anchor 文件</td>
+<td>TPM/License-key 签名验证失败</td>
+</tr>
+<tr>
+<td>回滚整个 WAL 目录到昨天</td>
+<td>anchor 跨日链断裂；中心侧已收到的 root 对不上</td>
+</tr>
+</tbody>
+</table>
+<h2 id="b7">B.7 恢复策略</h2>
+<ul>
+<li><strong>段文件磁盘损坏</strong>：从最近一份未签名归档 + 中心侧已收到的 anchor 起点，差量重算到该段起点；缺失区间标记为"不可恢复"，触发人工对账。</li>
+<li><strong>anchor 文件丢失</strong>：可由 WAL 重算重建，但<strong>不可签名</strong>——需要计费中心配合补签一份"补发 anchor"，记录在案。</li>
+<li><strong>License 密钥轮换</strong>：每张 License 都有自己的 anchor 签名密钥，新旧 License 期间的 anchor 各自独立验证。</li>
+</ul>
+<hr />
+<h1 id="clicense-sop">附录 C：License 续期与刷新 SOP</h1>
+<h2 id="c1-license">C.1 License 生命周期</h2>
+<pre><code>[未签发] ──issue──► [有效期内]
+                       │
+                       │ 即将到期 (T-30d)
+                       ▼
+                  [续期提醒]
+                       │
+            ┌──────────┴──────────┐
+            ▼                     ▼
+        正常续期               未续期
+            │                     │
+            ▼                     ▼
+       [新 License 生效]    [过期] ──T+7d──► [全量阻断]
+                                  ▲
+                                  └── 7 天宽限期：只读+预警
+</code></pre>
+<h2 id="c2">C.2 角色与产物</h2>
+<table>
+<thead>
+<tr>
+<th>角色</th>
+<th>职责</th>
+<th>产物</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>计费中心 (Issuer)</td>
+<td>持有 HSM 私钥，签发文件</td>
+<td><code>*.license</code>, <code>*.lrf</code></td>
+</tr>
+<tr>
+<td>客户管理员</td>
+<td>触发续期、运送介质、导入文件</td>
+<td>提交 <code>*.ubp</code></td>
+</tr>
+<tr>
+<td>私有云 Billing GW</td>
+<td>校验/装载/汇报</td>
+<td>状态指标、告警</td>
+</tr>
+<tr>
+<td>商务 / 销售</td>
+<td>合同对齐、定价方案确认</td>
+<td>续期订单</td>
+</tr>
+</tbody>
+</table>
+<h2 id="c3-sopa">C.3 在线模式续期 SOP（A 类）</h2>
+<pre><code>T-30d  系统自动检测 License 剩余期限 &lt; 30 天 → 推送续期工单
+T-15d  客户支付 / 商务对齐 pricing_version
+T-7d   计费中心生成新 License，自动推送到私有云 → 双 License 并存
+T0     旧 License 到期，自动切换；监控验证流量平稳
+T+1d   归档旧 License，写入审计日志
+</code></pre>
+<p>技术细节：私有云 Billing GW 启动时加载<strong>所有</strong>未过期 License，按 <code>valid_from</code> 排序使用，自然过渡无需重启。</p>
+<h2 id="c4-sopc">C.4 气隙模式续期 SOP（C 类）</h2>
+<p>最严格场景，全程人工 + 介质：</p>
+<pre><code>┌──────────── 客户侧 ────────────┐    ┌──────────── 厂商侧 ────────────┐
+
+T-30d  系统预警 License 余量/期限                                       
+
+T-25d  客户管理员执行：                                                 
+       billing-cli export usage \                                       
+         --since last-settled \                                         
+         --out usage-2026-05.ubp                                        
+       (包含本期所有用量 + Merkle root + TPM 签名)                      
+
+T-24d  U 盘运送 ─────────────────►   T-24d  接收 .ubp                   
+                                            校验签名/指纹/Merkle 链     
+                                            导入计费系统                
+                                            生成结算单 → 客户付款        
+
+                                     T-20d  生成 License Refresh:        
+                                            - 续期 / 加点 / 调价        
+                                            - 含本期已确认扣减游标       
+                                            - HSM 签名                  
+
+T-15d  接收 .lrf ◄───────────────── 邮寄 / 派送                         
+
+T-14d  客户管理员执行：                                                 
+       billing-cli license refresh \                                    
+         license-refresh-2026-06.lrf                                    
+       → 校验 → 更新 LocalQuotaStore                                    
+       → 截断已结算的 WAL（归档到只读区）                                
+       → 新 License 立即可用                                            
+
+T-13d  执行 billing-cli audit verify 全量校验                           
+       上传校验报告确认                                                 
+└────────────────────────────────┘    └────────────────────────────────┘
+</code></pre>
+<h2 id="c5-license-refresh-lrf">C.5 License Refresh 文件格式（<code>.lrf</code>）</h2>
+<pre><code class="language-jsonc">{
+  &quot;lrf_id&quot;: &quot;LRF-2026-0612-0001&quot;,
+  &quot;license_id&quot;: &quot;LIC-2026-0001&quot;,
+  &quot;seq&quot;: 7,                         // 严格递增，防重放
+  &quot;issued_at&quot;: &quot;2026-06-12T03:00:00Z&quot;,
+  &quot;actions&quot;: [
+    {
+      &quot;type&quot;: &quot;ack_usage&quot;,
+      &quot;until_anchor&quot;: &quot;sha256:abc...&quot;,   // 中心已确认到这一天的 anchor
+      &quot;settled_points&quot;: 8429311          // 中心算出的已结算点数
+    },
+    {
+      &quot;type&quot;: &quot;extend_validity&quot;,
+      &quot;new_valid_until&quot;: &quot;2027-06-11&quot;
+    },
+    {
+      &quot;type&quot;: &quot;topup&quot;,
+      &quot;add_points&quot;: 5000000              // 新增点数
+    },
+    {
+      &quot;type&quot;: &quot;update_pricing&quot;,
+      &quot;new_pricing_version&quot;: &quot;v2026.06&quot;  // 价格调整，下一秒生效
+    }
+  ],
+  &quot;previous_lrf_hash&quot;: &quot;sha256:...&quot;,  // 形成续期事件链
+  &quot;signature&quot;: &quot;base64(Ed25519)&quot;
+}
+</code></pre>
+<p>私有云接收逻辑：</p>
+<pre><code class="language-python">def apply_refresh(lrf):
+    verify_signature(lrf, license.issuer_pubkey)
+    assert lrf.license_id == license.id
+    assert lrf.seq == license.last_lrf_seq + 1     # 严格连续
+    assert lrf.previous_lrf_hash == sha256(license.last_lrf)
+
+    for action in lrf.actions:
+        if action.type == &quot;ack_usage&quot;:
+            # 关键：必须先核对本地 anchor 与中心一致才能截断 WAL
+            local_root = compute_anchor_up_to(action.until_anchor_date)
+            assert local_root == action.until_anchor
+            mark_settled(action.until_anchor)
+            truncate_wal_before(action.until_anchor)
+            assert local_settled_points == action.settled_points
+        elif action.type == &quot;extend_validity&quot;:
+            license.valid_until = action.new_valid_until
+        elif action.type == &quot;topup&quot;:
+            license.total_points += action.add_points
+        elif action.type == &quot;update_pricing&quot;:
+            pricing_store.load(action.new_pricing_version)
+
+    license.last_lrf = lrf
+    license.last_lrf_seq = lrf.seq
+    persist(license)
+</code></pre>
+<h2 id="c6-sop">C.6 异常 SOP</h2>
+<table>
+<thead>
+<tr>
+<th>异常</th>
+<th>处理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>.ubp</code> 在路途丢失</td>
+<td>客户重新导出（同 seq 内容确定），无副作用</td>
+</tr>
+<tr>
+<td><code>.lrf</code> 在路途丢失</td>
+<td>计费中心可重新签发<strong>同 seq</strong> lrf；旧 lrf 一旦使用即作废</td>
+</tr>
+<tr>
+<td><code>.lrf</code> seq 不连续</td>
+<td>私有云拒绝装载，要求补发缺失序号的 lrf</td>
+</tr>
+<tr>
+<td>本地 root 与中心 root 不一致</td>
+<td>阻断 ack_usage 动作，进入"账目争议"流程：双方人工对账，可能由 anchor 维度逐日定位差异</td>
+</tr>
+<tr>
+<td>客户长期不导出（&gt;90 天）</td>
+<td>计费中心标记"失联"，触发商务介入；私有云本身仍能消费到 License 余量耗尽</td>
+</tr>
+<tr>
+<td>客户主动退订</td>
+<td>签发"终止 lrf"：禁止新增扣费，仅允许导出最后一份 ubp 完成清算</td>
+</tr>
+</tbody>
+</table>
+<h2 id="c7">C.7 度量与告警（私有云本地）</h2>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>阈值</th>
+<th>告警</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>license.remaining_days</code></td>
+<td>&lt; 30 / &lt; 7</td>
+<td>warning / critical</td>
+</tr>
+<tr>
+<td><code>license.remaining_points / daily_avg_use</code></td>
+<td>&lt; 30 天用量</td>
+<td>warning</td>
+</tr>
+<tr>
+<td><code>wal.unsettled_days</code></td>
+<td>&gt; 14</td>
+<td>warning（提醒导出）</td>
+</tr>
+<tr>
+<td><code>wal.unsettled_days</code></td>
+<td>&gt; 60</td>
+<td>critical</td>
+</tr>
+<tr>
+<td><code>lrf.seq_gap</code></td>
+<td>&gt; 0</td>
+<td>critical（缺失续期文件）</td>
+</tr>
+<tr>
+<td><code>audit.verify_failed</code></td>
+<td>任意</td>
+<td>critical（立刻通知客户与厂商）</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h1 id="d">附录 D：参考时序图</h1>
+<h2 id="d1-llm">D.1 公有云一次 LLM 调用完整链路</h2>
+<pre><code>Client ─► APIGW ─► LLM Service ─► Billing GW                Redis     DB
+   │                                  │                       │       │
+   │── POST /chat ────────────────►   │                       │       │
+   │                                  │── hold(max=5300) ──►  │ Lua   │
+   │                                  │                       │ atom  │
+   │                                  │◄── hold_id ──────────│        │
+   │                                  │                       │── async ─►│
+   │                                  │── invoke upstream ──► (LLM)
+   │                                  │◄── result (tokens=481) ────────
+   │                                  │── commit(712) ────►   │ Lua   │
+   │                                  │◄── balance ──────────│        │
+   │◄── 200 OK + Usage ───────────────│                       │── async ─►│
+                                                                       (WAL)
+</code></pre>
+<h2 id="d2">D.2 气隙私有云续期完整时序</h2>
+<pre><code>私有云 BGW             U盘介质            计费中心
+   │                     │                   │
+   │ T-25: export ──►    │                   │
+   │                     │ ──物理运送──►     │
+   │                     │                   │ T-24: import + verify
+   │                     │                   │ T-22: generate settlement
+   │                     │                   │ T-20: sign LRF
+   │                     │ ◄──物理运送──     │
+   │                     │                   │
+   │ T-15: refresh ◄──   │                   │
+   │ verify + apply      │                   │
+   │ truncate WAL        │                   │
+   │ continue serving    │                   │
+   │                     │                   │
+</code></pre>
+<hr />
+<h1 id="elicense-only">附录 E：纯许可文件模式（License-Only / 完全单向）</h1>
+<h2 id="e1">E.1 场景定义</h2>
+<p>部分客户的部署环境是<strong>严格单向气隙</strong>：
+- 没有 U 盘、移动介质、临时网络通道；
+- 内网与外网之间只允许<strong>单向</strong>信息流（厂商 → 客户），且只能通过有限渠道（如安全邮件、纸面 QR 码、人工抄录的字符串、内部 OA 转交等）；
+- 客户<strong>永远不会</strong>把任何运行时数据（包括 <code>.ubp</code> 用量包）回传给厂商；
+- 厂商对客户的实际用量"无可见性"，也接受这一现实。</p>
+<p>这种场景下，<strong>许可文件是唯一的契约载体</strong>，必须在签发时就把所有商业与技术约束全部固化进去。</p>
+<h2 id="e2">E.2 商业模型调整：从"后付费对账"退化为"严格预付费"</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>标准气隙模式（附录 C）</th>
+<th>纯许可文件模式（本附录）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>计费模式</td>
+<td>预付点数 + 后续按实际用量结算</td>
+<td><strong>纯预付，不结算</strong>，许可即收据</td>
+</tr>
+<tr>
+<td>厂商可见性</td>
+<td>通过 <code>.ubp</code> 拿到完整明细</td>
+<td><strong>零可见性</strong>，只知发了多少点</td>
+</tr>
+<tr>
+<td>客户超用</td>
+<td>通过 ack_usage 校正</td>
+<td>不可能（本地强阻断，用完即停）</td>
+</tr>
+<tr>
+<td>价格调整</td>
+<td>通过 <code>.lrf</code> 实时生效</td>
+<td>只能随<strong>下一张许可</strong>生效</td>
+</tr>
+<tr>
+<td>退款</td>
+<td>多退少补</td>
+<td>不支持；剩余点数随许可过期作废</td>
+</tr>
+<tr>
+<td>合同</td>
+<td>按量计费协议</td>
+<td>类似<strong>预付卡 / 序列号软件授权</strong></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>核心心智转变：在纯许可文件模式下，<strong>许可文件即"已付款的点数券"</strong>。厂商不再关心客户怎么花，只关心：(1) 客户不能花超签发的额度，(2) 客户不能复制/重放许可。</p>
+</blockquote>
+<h2 id="e3">E.3 许可文件结构（自包含、无回执）</h2>
+<p>相对附录 C 的许可格式做三处加固：</p>
+<pre><code class="language-jsonc">{
+  &quot;license_id&quot;: &quot;LIC-AIRGAP-2026-0001&quot;,
+  &quot;license_kind&quot;: &quot;airgap_oneway&quot;,       // 标识纯许可模式
+
+  &quot;tenant&quot;: &quot;acme-corp&quot;,
+  &quot;deployment_id&quot;: &quot;DEP-7f2a...&quot;,        // 一份许可只能装在一个部署上
+  &quot;hardware_fingerprint&quot;: &quot;sha256:...&quot;,
+
+  &quot;issued_at&quot;: &quot;2026-05-18T00:00:00Z&quot;,
+  &quot;valid_from&quot;: &quot;2026-05-18&quot;,
+  &quot;valid_until&quot;: &quot;2027-05-17&quot;,           // 即便点数没用完也必须到期作废
+
+  &quot;quota&quot;: {
+    &quot;total_points&quot;: 10000000,
+    &quot;overdraft_points&quot;: 0,
+    &quot;no_refund&quot;: true                    // 明确不退
+  },
+
+  &quot;pricing_table&quot;: {                     // 整张定价表直接嵌入，自包含
+    &quot;version&quot;: &quot;v2026.05&quot;,
+    &quot;rules&quot;: [
+      {&quot;meter&quot;: &quot;sms.cn.normal&quot;, &quot;unit&quot;: 1,    &quot;points&quot;: 1},
+      {&quot;meter&quot;: &quot;llm.gpt4o.input&quot;,  &quot;unit&quot;: 1000, &quot;points&quot;: 0.3},
+      {&quot;meter&quot;: &quot;llm.gpt4o.output&quot;, &quot;unit&quot;: 1000, &quot;points&quot;: 1.2}
+      // ... 整表
+    ]
+  },
+
+  &quot;meters_allowed&quot;: [&quot;sms.cn.*&quot;, &quot;llm.gpt4o.*&quot;],
+
+  &quot;anti_replay&quot;: {
+    &quot;license_seq&quot;: 7,                    // 同一 tenant 严格递增
+    &quot;supersedes&quot;: [&quot;LIC-AIRGAP-2026-0000&quot;],  // 显式废弃之前的许可
+    &quot;min_monotonic_counter&quot;: 184213      // 见 E.5 防 VM 回滚
+  },
+
+  &quot;reporting&quot;: {
+    &quot;mode&quot;: &quot;none&quot;                       // 关键：明确告诉 BGW 不要尝试上报
+  },
+
+  &quot;signature&quot;: &quot;base64(Ed25519)&quot;
+}
+</code></pre>
+<p><strong>关键约束</strong>：
+- <code>pricing_table</code> 完整内嵌——许可不仅是授权，也是这段时间的"价格快照"；
+- <code>valid_until</code> 强制存在，点数没用完也会过期，避免厂商对客户的永久承诺；
+- <code>reporting.mode = "none"</code> 让 BGW 在启动时跳过所有上报代码路径，不会因为尝试连接外网而产生告警噪音。</p>
+<h2 id="e4">E.4 许可分发的"一字节信道"友好编码</h2>
+<p>由于运送渠道可能极其受限（人工抄录、电话报读、纸面 QR、扫描件 OCR），许可必须能压到尽量小：</p>
+<table>
+<thead>
+<tr>
+<th>编码层</th>
+<th>选型</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>数据格式</td>
+<td><strong>CBOR</strong>（非 JSON）</td>
+<td>二进制紧凑，签名前序列化确定</td>
+</tr>
+<tr>
+<td>数字签名</td>
+<td><strong>Ed25519</strong></td>
+<td>64 字节签名，远小于 RSA</td>
+</tr>
+<tr>
+<td>字符编码</td>
+<td><strong>Base32 Crockford</strong></td>
+<td>大小写不敏感、剔除易混字符 (0/O/1/I/L)</td>
+</tr>
+<tr>
+<td>校验</td>
+<td>每 5 段加 1 字节 CRC</td>
+<td>抄录时能逐段校验</td>
+</tr>
+<tr>
+<td>可选载体</td>
+<td><strong>QR Code (M 级容错)</strong></td>
+<td>一页 A4 即可印 ~2KB</td>
+</tr>
+</tbody>
+</table>
+<p>典型紧凑许可大小：~600 字节 → Base32 后 ~960 字符 → 12 段 × 10 行抄录，或一张 QR 码。</p>
+<pre><code class="language-bash">$ billing-cli license import --from-text
+请逐段输入许可（每段 8 字符 + 1 字符校验位）：
+&gt; A8GH2K4M-3
+&gt; P7QR9XYZ-K
+&gt; ...
+[OK] 12 段校验通过
+[OK] 签名验证通过
+[OK] 设备指纹匹配
+[OK] license_seq=7，废弃旧许可 LIC-AIRGAP-2026-0000
+[OK] 已激活，可用点数：10,000,000
+</code></pre>
+<h2 id="e5-vm">E.5 防 VM 快照回滚（本模式最大攻击面）</h2>
+<p><strong>威胁</strong>：客户对运行中的 BGW VM 做快照，消耗 500 万点后回滚到快照状态，理论上可无限白嫖。U 盘模式下，可通过定期上报让中心察觉；<strong>单向模式下没有上报通道</strong>，必须把防御做到本地。</p>
+<h3 id="1tpm">防御 1：TPM 单调计数器锚定</h3>
+<pre><code>每次扣费 commit 时：
+  tpm_counter = TPM_NV_Increment()        # TPM 硬件计数器，物理只增
+  usage_record.tpm_counter = tpm_counter
+  usage_record.this_hash    = H(... || tpm_counter)
+
+启动时：
+  if tpm_counter &lt; license.min_monotonic_counter:
+      → 检测到回滚，进入&quot;账目冻结&quot;，拒绝服务
+</code></pre>
+<p>TPM NV Counter 是芯片级硬件资源，<strong>VM 快照无法回滚 TPM 状态</strong>（即便客户回滚 VM，TPM 计数器仍然在前进），所以一旦回滚，本地哈希链与 TPM 状态必然对不上。</p>
+<blockquote>
+<p>无 TPM 的部署：可降级使用 <strong>vTPM + Secure Boot + 远程证明初始化</strong>，但安全性下降；纯软件方案（写文件 + 加密时间戳）无法防止有 root 权限的回滚，必须在合同里明确"客户自行承诺不回滚"。</p>
+</blockquote>
+<h3 id="2-heartbeat-burn">防御 2：心跳消耗 (Heartbeat Burn)</h3>
+<pre><code>每分钟自动扣 0.01 点作为&quot;时间证明费&quot;（heartbeat burn）：
+  - 微不足道，不影响成本结构
+  - 但是构成一条&quot;时间在前进&quot;的硬证据
+  - 回滚 VM 必然丢失这部分扣费，本地哈希链断裂
+
+异常检测：
+  if now - last_heartbeat &gt; 5 min:
+      → wall_clock 跳跃告警，记录但不阻断
+  if heartbeat 次数 &lt; (now - boot_time) / 1 min - tolerance:
+      → 严重不一致，进入&quot;账目冻结&quot;
+</code></pre>
+<h3 id="3_1">防御 3：墙钟单调性</h3>
+<pre><code>持久化 max_seen_wall_clock 到 chattr +a 文件：
+  每秒更新一次
+  启动时：if system_time &lt; max_seen_wall_clock - 60s: 阻断
+</code></pre>
+<h3 id="4license">防御 4：License 强绑定运行环境</h3>
+<p><code>hardware_fingerprint</code> 在纯许可模式下扩展为：
+- CPU 序列号 + 主板 UUID + 网卡 MAC
+- TPM EK Public Key 哈希（<strong>最关键</strong>，TPM 物理迁移成本极高）
+- Secure Boot PCR 0/2/4 值（操作系统未被替换）</p>
+<p>签发时 customer 先跑 <code>billing-cli env fingerprint</code> 生成指纹文件，<strong>通过反方向</strong>（客户 → 厂商，可能是当面提交、内部 OA 单等）报给厂商；厂商把指纹烧进许可后单向交付。</p>
+<h2 id="e6">E.6 客户单方审计（厂商不参与对账）</h2>
+<p>这种模式下，厂商既然看不到用量，也就<strong>不再为客户做对账</strong>。客户内部要做的事：</p>
+<pre><code class="language-bash"># 客户审计员定期执行
+$ billing-cli audit standalone-report --month 2026-05
+========================================
+本月用量审计报告（独立验证，无需厂商参与）
+========================================
+许可:      LIC-AIRGAP-2026-0001
+本月扣费:  712,341 点
+余量:      9,287,659 点
+哈希链:    [OK] 1,432,118 条记录，无中断
+TPM 锚定:  [OK] 计数器 +1,432,118 与记录数一致
+Daily Anchors: [OK] 31 天全部签名有效
+
+按部门拆分（基于 request_id 中的 X-Tenant-Dept Header）：
+  - 营销部: 451,200 点 (63.3%)
+  - 客服部: 198,134 点 (27.8%)
+  - 研发部:  63,007 点 ( 8.9%)
+========================================
+导出 PDF 至 /reports/2026-05.pdf（含全部 Merkle 证明）
+</code></pre>
+<p>这份报告由<strong>客户内部财务/审计部门</strong>使用，做内部成本分摊；厂商既不收也不审。</p>
+<h2 id="e7-sop">E.7 续期 / 加点 SOP（纯单向）</h2>
+<h3 id="_2">触发方式（客户 → 厂商，走业务渠道而非数据渠道）</h3>
+<table>
+<thead>
+<tr>
+<th>触发方式</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>邮件 / 电话 / OA 工单</td>
+<td>客户管理员人工通知销售</td>
+</tr>
+<tr>
+<td>客户自助门户（建在外网）</td>
+<td>客户在公司外网下单，与气隙环境无关</td>
+</tr>
+<tr>
+<td>自动续期合同</td>
+<td>合同约定每月 1 号厂商主动签发并交付</td>
+</tr>
+</tbody>
+</table>
+<p><strong>关键</strong>：触发动作不携带任何"实际用量"信息，厂商<strong>不知道</strong>客户用了多少，只按合同/订单签发约定的点数。</p>
+<h3 id="_3">交付方式（厂商 → 客户）</h3>
+<table>
+<thead>
+<tr>
+<th>渠道</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>加密邮件附件（PGP）</td>
+<td>客户邮件系统能收外网邮件时</td>
+</tr>
+<tr>
+<td>客户专属 HTTPS 下载门户</td>
+<td>客户 DMZ 区有受控下载机</td>
+</tr>
+<tr>
+<td>纸面 QR 码（挂号信 / 当面交付）</td>
+<td>严格隔离环境</td>
+</tr>
+<tr>
+<td>客户安保人员口头/抄录</td>
+<td>极端场景，需配合校验位</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_4">装载流程</h3>
+<pre><code class="language-bash"># 1. 客户审计员先生成新一张许可所需的环境指纹（如果机器有变）
+$ billing-cli env fingerprint --out env.fpr
+# 通过业务渠道发给厂商
+
+# 2. 厂商签发并交付新许可
+
+# 3. 客户装载（不影响在线服务）
+$ billing-cli license import LIC-AIRGAP-2026-0002.lic
+[OK] 签名验证通过
+[OK] 设备指纹匹配
+[OK] license_seq=8，将在 LIC-...-0001 耗尽或过期后接管
+[OK] 已加入许可栈：
+       LIC-...-0001  剩余 9.28M 点  到期 2027-05-17 (active)
+       LIC-...-0002  10.00M 点      到期 2028-05-17 (queued)
+</code></pre>
+<p><strong>许可栈（License Stack）</strong>：BGW 同时持有多张未过期许可，按 <code>valid_from</code> 顺序消耗，无缝衔接，无需停机。</p>
+<h3 id="_5">紧急加点（点数即将耗尽）</h3>
+<pre><code>T-?d  本地告警：&quot;余量将在 5 天后耗尽&quot;
+      ↓
+      客户运维通过电话/邮件向厂商申请紧急许可
+      ↓
+T-1d  厂商签发 emergency license（小额、短期有效）
+      ↓
+      通过最快可用渠道（如安保人员当面送达 QR 码打印件）
+      ↓
+T0    客户手工抄录 + import，服务不中断
+</code></pre>
+<h2 id="e8">E.8 失效边界与降级表现</h2>
+<table>
+<thead>
+<tr>
+<th>触发条件</th>
+<th>系统行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>所有许可点数耗尽</td>
+<td>新请求一律 <code>402 Payment Required</code>，已 hold 的允许 commit</td>
+</tr>
+<tr>
+<td>所有许可均过期</td>
+<td>全量阻断，仅允许 audit / export 命令</td>
+</tr>
+<tr>
+<td>TPM 计数器倒退（检测到回滚）</td>
+<td>立即冻结扣费，写最终 <code>freeze_event</code> 进 WAL，需要厂商签发"解冻许可"才能恢复</td>
+</tr>
+<tr>
+<td>设备指纹失配（如更换主板）</td>
+<td>拒绝装载新许可，需要厂商基于新指纹重新签发</td>
+</tr>
+<tr>
+<td>许可文件被篡改</td>
+<td>签名校验失败，拒绝装载，不影响已激活许可</td>
+</tr>
+<tr>
+<td>时间被回拨 &gt; 60s</td>
+<td>warning 告警；超过 1 小时阻断扣费</td>
+</tr>
+</tbody>
+</table>
+<h2 id="e9">E.9 合同与流程层面的兜底</h2>
+<p>由于技术上完全无回执，必须用合同/流程补足信任：</p>
+<ol>
+<li><strong>预付不退条款</strong>：合同明确"许可一经签发即视为已结算，剩余点数随过期作废"。</li>
+<li><strong>客户自审计承诺</strong>：客户承诺不主动篡改 BGW、不回滚 VM；厂商保留通过现场审计验证的权利。</li>
+<li><strong>环境变更通知</strong>：硬件迁移、操作系统重装等需要重新生成指纹并重新签发许可，客户承担流程成本。</li>
+<li><strong>价格变更窗口</strong>：定价调整最早影响下一张许可，已签发许可的内嵌定价不可变。</li>
+<li><strong>应急联系渠道</strong>：合同里固定 7×24 应急联系人，紧急加点 SOP 走专线，不依赖在线系统。</li>
+</ol>
+<h2 id="e10">E.10 时序图：纯单向续期</h2>
+<pre><code>客户内部                    业务渠道                       厂商
+  │                          │                            │
+  │ (本地告警: 30 天后到期)  │                            │
+  │                          │                            │
+  │ 生成新环境指纹           │                            │
+  │ env.fpr ─────────────────► (邮件/工单/OA)             │
+  │                          │ ──────────────────────────►│
+  │                          │                            │ 销售对齐订单
+  │                          │                            │ 签发 LIC-...-0002.lic
+  │                          │                            │ HSM 签名
+  │                          │ ◄──────────────────────────│
+  │                          │ (加密邮件 / 纸面 QR /         │
+  │                          │  下载门户)                  │
+  │ ◄────────────────────────│                            │
+  │                          │                            │
+  │ license import --verify │                            │
+  │ 加入许可栈，无缝接管     │                            │
+  │                          │                            │
+  │ (本地审计员每月生成      │                            │
+  │  standalone-report)      │                            │
+  │ 用于公司内部成本分摊      │                            │
+  │ 不发送给厂商             │                            │
+</code></pre>
+<h2 id="e11">E.11 模式对比速查</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>公有云</th>
+<th>在线私有云 (A)</th>
+<th>半离线 (B)</th>
+<th>U 盘气隙 (C)</th>
+<th><strong>纯许可 (E)</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>数据回传</td>
+<td>实时</td>
+<td>准实时</td>
+<td>每日打包</td>
+<td>周期 U 盘</td>
+<td><strong>完全无</strong></td>
+</tr>
+<tr>
+<td>厂商可见性</td>
+<td>完全</td>
+<td>完全</td>
+<td>完全</td>
+<td>完全（T+周期）</td>
+<td><strong>零</strong></td>
+</tr>
+<tr>
+<td>计费精度</td>
+<td>实时秒级</td>
+<td>分钟级</td>
+<td>日级</td>
+<td>周/月级</td>
+<td><strong>不结算</strong></td>
+</tr>
+<tr>
+<td>客户超用风险</td>
+<td>强一致拦截</td>
+<td>短窗口</td>
+<td>1 日窗口</td>
+<td>1 周窗口</td>
+<td><strong>本地强阻断</strong></td>
+</tr>
+<tr>
+<td>价格调整周期</td>
+<td>即时</td>
+<td>即时</td>
+<td>即时</td>
+<td>周期</td>
+<td><strong>下一张许可</strong></td>
+</tr>
+<tr>
+<td>防 VM 回滚</td>
+<td>N/A</td>
+<td>N/A</td>
+<td>弱依赖</td>
+<td>中等</td>
+<td><strong>TPM + heartbeat 强依赖</strong></td>
+</tr>
+<tr>
+<td>客户 IT 复杂度</td>
+<td>极低</td>
+<td>低</td>
+<td>中</td>
+<td>高</td>
+<td><strong>极高</strong></td>
+</tr>
+<tr>
+<td>厂商运营成本</td>
+<td>低</td>
+<td>低</td>
+<td>中</td>
+<td>中</td>
+<td><strong>高（依赖人工渠道）</strong></td>
+</tr>
+<tr>
+<td>适用客户</td>
+<td>互联网</td>
+<td>一般企业</td>
+<td>金融 / 政企</td>
+<td>国央企 / 军工</td>
+<td><strong>涉密 / 关键基础设施</strong></td>
+</tr>
+</tbody>
+</table>
+
+<hr />
+
+<h1 id="appendix-f">附录 F：完全离线模式下的扣减正确性保障</h1>
+
+<p>本附录针对附录 E 描述的<strong>纯许可文件模式</strong>，回答一个问题：<strong>在没有任何远端协调者的情况下，本地如何保证扣减是正确的、不丢、不重、不被绕过、断电不坏账、回滚能察觉</strong>。</p>
+
+<h2 id="f1">F.1 局部 ACID 与可接受的妥协</h2>
+
+<table>
+<thead><tr><th>性质</th><th>必须保证</th><th>实现手段</th></tr></thead>
+<tbody>
+<tr><td>原子性 (A)</td><td>一次扣减要么完全生效要么完全无效，不允许"扣了点数但未写日志"或反之</td><td>串行写入器 + WAL 先于状态 + fsync</td></tr>
+<tr><td>一致性 (C)</td><td>任意时刻 <code>available = Σlicense - Σcommitted - Σheld</code> 恒等</td><td>状态从 WAL 派生，启动时回放重建</td></tr>
+<tr><td>隔离性 (I)</td><td>并发请求看到的余额相互一致，不能"双花"许可</td><td>单写者 actor + 内存余额受写者独占</td></tr>
+<tr><td>持久性 (D)</td><td>对客户端返回成功的扣减，必须能在重启 / 掉电后保留</td><td>WAL 段 <code>O_APPEND|O_DSYNC</code> + 显式 fsync</td></tr>
+<tr><td>反回滚</td><td>VM 快照回滚必须被察觉</td><td>TPM NV 单调计数器 + 心跳消耗</td></tr>
+<tr><td>反篡改</td><td>root 用户也无法静默删/改记录</td><td><code>chattr +a</code> + Merkle 链 + TPM 签名</td></tr>
+<tr><td>幂等性</td><td>业务侧重试不导致重复扣费</td><td>request_id 持久索引</td></tr>
+</tbody>
+</table>
+
+<p>不保证的：跨节点强一致（见 F.8 HA 章），毫秒级时钟正确（仅保证单调），TPM 故障后的高安全等级（降级到文件计数器 + 告警）。</p>
+
+<h2 id="f2">F.2 状态模型 —— "WAL 即真理，余额只是缓存"</h2>
+
+<p>本地<strong>不</strong>把"剩余点数"当作权威状态。权威状态只有两类：</p>
+
+<ol>
+<li><strong>已装载的许可集合</strong> —— 不变量，由签名校验保护</li>
+<li><strong>WAL 上的扣减记录链</strong> —— 仅追加，由哈希链 + TPM 计数器保护</li>
+</ol>
+
+<p>"可用余额"是一个<strong>派生量</strong>：</p>
+
+<pre><code>available_points(t) =   Σ license.total_points (license in active_stack)
+                      - Σ record.points         (record in WAL, state=COMMITTED)
+                      - Σ hold.points           (hold in active, not yet finalized)
+                      - Σ heartbeat.points      (heartbeat burn 累计)
+</code></pre>
+
+<p>意味着：<strong>quota DB 损坏永远不会丢钱</strong>——重启时从 WAL 全量回放就能精确重建余额。这是离线模式可信的根基。</p>
+
+<h2 id="f3">F.3 串行写入器 —— 用单线程换确定性</h2>
+
+<pre><code>             ┌─────────── Business goroutines (并发) ───────────┐
+             │   hold(req1)    commit(req2)    cancel(req3) ... │
+             └──────────────────────┬────────────────────────────┘
+                                    │ 通过 channel 投递 Op
+                                    ▼
+                       ┌────────────────────────┐
+                       │   单写入器 goroutine   │   ← 严格串行
+                       │   (Quota Writer Actor) │
+                       └─────┬──────────┬───────┘
+                             │          │
+                       (1) 内存余额   (2) WAL.append + fsync
+                       (3) TPM NV    (4) reply channel
+</code></pre>
+
+<p>选择 actor 模型而不是锁/事务的理由：</p>
+
+<ul>
+<li>写路径 TPS 上限由"TPM 增量 + fsync"决定，约 100~500 ops/s，单线程足够；</li>
+<li>读路径（查余额）走原子快照，并发无阻塞；</li>
+<li>没有锁就没有死锁，没有事务就没有 ABA / 幻读；</li>
+<li>所有持久化顺序由单一队列决定，崩溃恢复的因果顺序天然清晰。</li>
+</ul>
+
+<h2 id="f4">F.4 完整扣减算法（含 TPM 锚定）</h2>
+
+<p>下面是写入器处理一次 <code>commit(request_id, items)</code> 的精确步骤。每一步的失败处理在右列。</p>
+
+<pre><code>function handle_commit(req):
+  ┌─── 阶段 1：纯校验，不改任何状态 ───┐
+  1. lookup idempotency_index[req.request_id]
+        if exists → 直接返回缓存结果（幂等命中）
+  2. 选择 active_license：栈中第一张未过期且 valid_from ≤ now 的
+        if none → 返回 LICENSE_EXHAUSTED
+  3. points = price(items) via active_license.pricing_table
+  4. if available_points &lt; points
+        if 允许跨许可拼接 → 拆分到下一张许可
+        else → 返回 INSUFFICIENT_POINTS
+  5. clock_check()：see F.6，异常则返回 CLOCK_ANOMALY
+
+  ┌─── 阶段 2：硬件锚定 ───┐
+  6. tpm_counter = TPM_NV_Increment(slot_usage)   // ~30~80ms
+        if 失败：见 F.9 降级表
+
+  ┌─── 阶段 3：持久化（关键路径，顺序不可变）───┐
+  7. record = {
+       seq         : last_seq + 1,
+       request_id  : req.request_id,
+       license_id  : active_license.id,
+       items       : items,
+       points      : points,
+       tpm_counter : tpm_counter,
+       wall_clock  : now,
+       prev_hash   : last_hash,
+     }
+  8. record.this_hash = SHA256(canonical(record))
+  9. encoded = CBOR(record)              // 紧凑、确定序列化
+ 10. wal_writer.append(encoded)          // open with O_APPEND|O_DSYNC
+ 11. fsync(wal_fd)                       // ← 真正的耐久性界限在这里
+        if fsync 失败 → panic（不能假装成功了）
+
+  ┌─── 阶段 4：内存生效（已耐久，安全更新）───┐
+ 12. balance.used += points
+ 13. last_seq = record.seq
+ 14. last_hash = record.this_hash
+ 15. idempotency_index[req.request_id] = {points, seq}   // 写回 + 异步落盘
+ 16. 通过 reply channel 返回成功
+
+  ┌─── 阶段 5：异步副作用（不影响正确性）───┐
+ 17. metric.observe(points)
+ 18. 周期性 checkpoint：把 balance / last_seq 写到 quota.db
+ 19. 每日 00:00：合 Daily Anchor + TPM 签名（见附录 B）
+</code></pre>
+
+<p><strong>核心顺序保证</strong>：TPM 增量 → WAL 写 → fsync → 内存生效。任何阶段崩溃都可由 F.5 的恢复算法收敛到唯一一致状态。</p>
+
+<h2 id="f5">F.5 崩溃恢复 —— 把"中间态"统一到"已扣或未扣"</h2>
+
+<p>由于 TPM 增量先于 WAL 写、WAL 写先于内存生效，重启时可能出现三种"中间态"：</p>
+
+<table>
+<thead><tr><th>异常</th><th>启动时表现</th><th>恢复动作</th></tr></thead>
+<tbody>
+<tr><td>掉电在第 6 步之后、第 10 步之前</td><td>TPM 计数器已增，WAL 未增</td><td>视为 <strong>幽灵增量</strong>：在 WAL 写入一条 <code>phantom_increment</code> 记录补齐，不扣点数；触发告警；下次客户端重试用同 request_id 仍会扣费（idempotency 未命中）</td></tr>
+<tr><td>掉电在第 10 步之后、fsync 返回前</td><td>记录可能写了一部分（kernel page cache 未落盘）</td><td>启动时按 CBOR 边界扫描，遇到不完整尾记录 truncate；下一条 prev_hash 校验天然把不完整记录排除</td></tr>
+<tr><td>掉电在 fsync 之后、第 12 步之前</td><td>WAL 完整、内存未更新</td><td>WAL 回放重建内存余额；客户端若重试用同 request_id → 幂等命中返回已扣结果</td></tr>
+</tbody>
+</table>
+
+<p><strong>完整恢复算法</strong>：</p>
+
+<pre><code>function recover():
+  1. 加载所有有效 license 文件，验证签名
+  2. tpm_counter_now = TPM_NV_Read(slot_usage)
+  3. 打开 WAL，从最后一个 Daily Anchor 开始顺序扫描
+        - 校验每条 record 的 prev_hash / this_hash
+        - 遇到 CBOR 解析失败的尾记录 → truncate 到上一条
+  4. last_record = WAL 最末一条有效记录
+  5. if last_record.tpm_counter &gt; tpm_counter_now:
+        // 严重：意味着 WAL 包含了"未来"的扣费 → 一定是回滚攻击
+        ENTER_FROZEN_STATE("tpm_rollback_detected")
+        return
+  6. if last_record.tpm_counter &lt; tpm_counter_now - tolerance:
+        // 存在幽灵增量，补齐 phantom 记录
+        append phantom_increment records
+        告警
+  7. 重建内存余额：available = Σlicense - Σcommitted - Σheartbeat
+  8. 加载 idempotency_index 持久化分片
+  9. 启动 heartbeat goroutine（见 F.6）
+ 10. ready
+</code></pre>
+
+<p>恢复期间<strong>拒绝服务新请求</strong>，对外返回 <code>503 Recovering</code>，避免在不一致状态下扣费。</p>
+
+<h2 id="f6">F.6 心跳与时钟保护 —— 让"时间"也变得不可篡改</h2>
+
+<p>纯离线模式没有 NTP / 远端时间源，必须本地构造"时间不可回退"的证据。</p>
+
+<h3>F.6.1 心跳消耗（Heartbeat Burn）</h3>
+
+<pre><code>独立 goroutine，每 60s 触发一次：
+  1. 通过同一写入器队列投递一条 HeartbeatOp
+  2. 写入器把它当作一笔特殊的扣费处理（金额 0.01 点）
+  3. 增量 TPM 的 slot_heartbeat（与扣费 slot 分开统计）
+  4. 落 WAL + fsync
+</code></pre>
+
+<p>作用：</p>
+
+<ul>
+<li><strong>构造时间证据</strong>：WAL 上的心跳序列证明"系统在某时段确实运行过"</li>
+<li><strong>反 VM 回滚兜底</strong>：回滚 VM 会丢失 N 分钟心跳记录，与 TPM_NV_Read 的当前值对比即可发现</li>
+<li><strong>反时钟篡改</strong>：见下节</li>
+</ul>
+
+<h3>F.6.2 单调墙钟检查</h3>
+
+<pre><code>function clock_check():
+  now = system_clock()
+  if now &lt; last_seen_wall_clock - 60s:
+      → CLOCK_ROLLBACK，扣费阻断
+  if now &gt; last_seen_wall_clock + 1h 且 距离上次启动 &lt; 1h:
+      → CLOCK_JUMP_FORWARD，告警但不阻断（可能合法 NTP 校准）
+  update last_seen_wall_clock = max(last_seen_wall_clock, now)
+        持久化到 chattr +a 文件，每 10s 强制 fsync
+</code></pre>
+
+<p>结合心跳：若管理员把时钟向前调 1 年，系统计算出"已运行 1 年应有 ~525K 条心跳"但实际只有 100 条，必然失配，触发冻结。</p>
+
+<h2 id="f7">F.7 许可栈无缝切换</h2>
+
+<p>客户可能同时持有多张未过期许可（紧急加点 + 续期 + 试用赠送），扣减时需要无停机切换。</p>
+
+<pre><code>active_stack = sort_by(valid_from)([lic for lic in loaded if not expired])
+
+function pick_license_for(points):
+  for lic in active_stack:
+      if lic.remaining &gt;= points and lic.supports(meters):
+          return lic, points
+  // 允许跨许可拼接？
+  if config.allow_cross_license_split:
+      // 第 1 张吃光 + 第 2 张补上
+      splits = []
+      remaining = points
+      for lic in active_stack:
+          take = min(lic.remaining, remaining)
+          if take &gt; 0: splits.append((lic, take)); remaining -= take
+          if remaining == 0: return splits
+  return INSUFFICIENT
+</code></pre>
+
+<p>跨许可扣减时，WAL 中写一条<strong>组合记录</strong>，分别记录每张许可消耗的份额，便于审计时回溯。许可耗尽后从栈中淘汰，但<strong>不删除 WAL 中对它的引用</strong>。</p>
+
+<h2 id="f8">F.8 HA 部署 —— 离线环境的可用性策略</h2>
+
+<p>客户经常要求 BGW 高可用。在没有外部协调（如 etcd / ZooKeeper）的离线环境，三种可行模式：</p>
+
+<table>
+<thead><tr><th>模式</th><th>架构</th><th>优点</th><th>缺点</th></tr></thead>
+<tbody>
+<tr>
+<td><strong>主备 + 共享存储</strong>（推荐）</td>
+<td>NAS 上放 WAL + quota.db；主节点持文件锁 <code>flock(LOCK_EX)</code>；备节点 flock 阻塞等待</td>
+<td>实现简单；故障切换 ~5s；数据强一致</td>
+<td>NAS 单点；切换瞬间业务超时重试</td>
+</tr>
+<tr>
+<td><strong>主备 + TPM 仲裁</strong></td>
+<td>两节点都尝试增量同一 TPM 计数器，每秒一次"心跳争抢"；增量成功者保有"主"身份</td>
+<td>不依赖共享存储</td>
+<td>需要 TPM 集群（或 TPM 池），运维复杂</td>
+</tr>
+<tr>
+<td><strong>许可分片</strong></td>
+<td>签发许可时切成 N 份子许可（如 100W 点切成 2×50W），每节点独占一份；耗尽前互不影响</td>
+<td>线性扩展；无单点</td>
+<td>余额碎片化；最后一段会出现"A 还有 30W、B 已 0"的不均衡</td>
+</tr>
+</tbody>
+</table>
+
+<p>三种模式都<strong>不能完美等价</strong>于在线模式的全局强一致——离线 HA 本质上是 CAP 三选二中放弃了一致性的部分窗口（主备切换瞬间可能短暂双写）。缓解：</p>
+
+<ul>
+<li>主备模式下，备节点接管前必须先回放 NAS 上的最新 WAL；</li>
+<li>切换窗口内的扣费用 request_id 幂等覆盖；</li>
+<li>定期 audit 比对 TPM 计数器与 WAL 长度，发现双写立刻冻结并报警。</li>
+</ul>
+
+<h2 id="f9">F.9 失败模式与降级矩阵</h2>
+
+<table>
+<thead><tr><th>失败</th><th>检测</th><th>响应</th><th>是否阻断扣费</th></tr></thead>
+<tbody>
+<tr><td>fsync 失败（磁盘故障）</td><td>系统调用错误</td><td>进程 panic，K8s 重启；状态从 WAL 重建</td><td>是（临时）</td></tr>
+<tr><td>磁盘满</td><td>write ENOSPC</td><td>新请求 503；已 hold 的允许 commit；告警</td><td>是（新请求）</td></tr>
+<tr><td>WAL 段哈希断裂</td><td>启动校验失败</td><td>冻结服务；提示从最近 Daily Anchor 差量重建</td><td>是</td></tr>
+<tr><td>quota.db 损坏</td><td>打开失败</td><td>从 WAL 全量回放重建</td><td>否（透明）</td></tr>
+<tr><td>TPM 不可用</td><td>TPM_RC_FAILURE</td><td>降级到加密锁文件计数器；持续告警；进入"低信任模式"</td><td>否</td></tr>
+<tr><td>TPM 计数器倒退</td><td>启动时比对</td><td>冻结，需要厂商签发"解冻许可"</td><td>是</td></tr>
+<tr><td>时钟回拨 &gt; 60s</td><td>clock_check</td><td>立即阻断扣费，等待人工确认</td><td>是</td></tr>
+<tr><td>所有许可耗尽</td><td>pick_license 返回空</td><td>新请求 402；已 hold 的允许 commit 完成</td><td>是（新请求）</td></tr>
+<tr><td>所有许可过期</td><td>每分钟扫描</td><td>全量阻断，仅允许 audit / export 命令</td><td>是</td></tr>
+<tr><td>许可签名失效</td><td>启动校验</td><td>该许可弃用，栈中其它许可继续服务</td><td>否</td></tr>
+<tr><td>idempotency 索引丢失</td><td>启动检测</td><td>从 WAL 重建（O(N) 扫描）</td><td>否（启动期间阻塞）</td></tr>
+</tbody>
+</table>
+
+<h2 id="f10">F.10 性能与吞吐</h2>
+
+<p>纯离线模式的写吞吐由三个串行步骤决定：</p>
+
+<table>
+<thead><tr><th>操作</th><th>典型延迟</th><th>优化手段</th></tr></thead>
+<tbody>
+<tr><td>TPM NV Increment</td><td>30~80 ms</td><td>批量化：1 次 TPM 增量代表 N 条记录，记录里写 "tpm_counter + intra_batch_seq"</td></tr>
+<tr><td>WAL append + fsync</td><td>1~10 ms (SSD)</td><td>Group commit：50ms 窗口或 64 条触发一次 fsync</td></tr>
+<tr><td>SHA256 + CBOR</td><td>&lt; 0.1 ms</td><td>无需优化</td></tr>
+</tbody>
+</table>
+
+<p>启用批量化后实测目标：</p>
+
+<ul>
+<li>单节点 <strong>2000~5000 commit/s</strong>（开启 group commit + TPM 批量）</li>
+<li>p99 延迟 &lt; 100ms</li>
+<li>批量化窗口最大 50ms，最坏新请求等待半个窗口</li>
+</ul>
+
+<p><strong>批量化的代价</strong>：若窗口内崩溃，该批所有未 fsync 的扣费全部丢失。但因为<strong>未返回成功</strong>，业务侧重试即可，幂等键保证不重复。代价仅是这批请求被延迟，不会错账。</p>
+
+<h2 id="f11">F.11 端到端示意</h2>
+
+<h3>F.11.1 一次正常扣减的字段流</h3>
+
+<pre><code>Business        Writer Actor    TPM           WAL file       quota.db
+   │                │             │              │              │
+   │── commit ────►│             │              │              │
+   │                │── increment ►│              │              │
+   │                │◄── ctr=4711 │              │              │
+   │                │             │              │              │
+   │                │── append ────────────────►│              │
+   │                │                            │ O_APPEND     │
+   │                │── fsync ────────────────►│ DSYNC        │
+   │                │◄────────────────────────  │              │
+   │                │             │              │              │
+   │                │── update in-mem balance ─────────────────►│ (异步)
+   │◄── 200 OK ────│             │              │              │
+                                                  ▲
+                              （每 100 条 / 30s checkpoint 一次）
+</code></pre>
+
+<h3>F.11.2 主备切换时序（NAS + flock 模式）</h3>
+
+<pre><code>Node-A (主)     NAS (WAL+lock)    Node-B (备)
+   │                 │                 │
+   │ flock(LOCK_EX)──►                 │
+   │ holding lock   │ ◄─ flock(WAIT) ─│
+   │ serving ...    │                 │
+   │                │                 │
+   X 崩溃            │                 │
+                    │── 锁自动释放 ────►│
+                    │                 │ flock 获取
+                    │ ◄── 读 WAL tail │
+                    │                 │ recover() 流程
+                    │                 │ ready
+                    │                 │ 开始 serving
+</code></pre>
+
+<h3>F.11.3 检测 VM 快照回滚</h3>
+
+<pre><code>T0   client commit → WAL.tpm_counter = 4710
+T0+1 client commit → WAL.tpm_counter = 4711
+T0+2 client commit → WAL.tpm_counter = 4712  ← 已落盘
+T0+3 攻击者拍摄 VM 快照
+T0+4 client commit → WAL.tpm_counter = 4713
+T0+5 攻击者回滚 VM 到 T0+3
+       VM 内 WAL 最末记录 tpm_counter=4712
+       但 TPM 物理芯片上 NV_Read = 4713（无法回滚）
+T0+6 BGW 启动 recover():
+       step 5: last_record.tpm_counter (4712) &lt; tpm_counter_now (4713)
+       → 进入 "tpm_counter ahead" 分支
+       → 写 phantom_increment 记录补齐
+       → 告警 "possible_rollback_detected"
+       注：单次出现可能是合法（如步骤 6 之后的崩溃），但
+            连续多次或大幅差距即可断定为攻击
+</code></pre>
+
+<h2 id="f12">F.12 一句话总结</h2>
+
+<p>完全离线模式下扣减的正确性，由"<strong>三个不可变 + 三个串行</strong>"共同保障：</p>
+
+<ul>
+<li><strong>三个不可变</strong>：许可签名不可伪造（Ed25519）、WAL 仅追加（<code>chattr +a</code>）、TPM 计数器只增（硬件）。</li>
+<li><strong>三个串行</strong>：单写入器 actor、TPM 先于 WAL 先于内存、fsync 是耐久性的唯一界限。</li>
+</ul>
+
+<p>余额本身从来不是权威状态——它只是 WAL 的派生缓存。任何崩溃 / 损坏 / 篡改尝试，都会在下次启动 recover() 时通过哈希链与 TPM 比对暴露出来，从而进入"冻结 + 人工介入"的安全降级路径。</p>
+
+<hr />
+
+<h1 id="appendix-g">附录 G：公有云 / 私有云单一代码库的统一架构</h1>
+
+<p>本附录回答：<strong>如何让公有云 SaaS 与各种形态的私有云（在线 / 半离线 / U 盘气隙 / 纯许可）共用同一份代码与同一个二进制</strong>，从而避免两套代码漂移、需求改一遍要做两次、bug 修复要同步到两侧的工程灾难。</p>
+
+<h2 id="g1">G.1 设计哲学</h2>
+
+<p>核心论断：<strong>公私两侧的业务语义其实 90% 是相同的</strong>。Meter 概念、Hold/Commit 状态机、点数计价、Usage 记录格式、Audit 哈希链——这些都不应该写两份。差异集中在<strong>基础设施层</strong>：</p>
+
+<ul>
+<li><strong>"余额从哪来"</strong>：公有云是 DB 行；私有云是许可文件解析结果</li>
+<li><strong>"状态写到哪"</strong>：公有云是 Redis + PG；私有云是 BoltDB + WAL 段文件</li>
+<li><strong>"用量上报给谁"</strong>：公有云是 Kafka → 数仓；私有云是本地归档（甚至 no-op）</li>
+<li><strong>"租户身份怎么来"</strong>：公有云是 JWT/API Key；私有云是 license 绑定的唯一租户</li>
+<li><strong>"时间锚定靠什么"</strong>：公有云是 NTP；私有云是 TPM + 心跳</li>
+</ul>
+
+<p>这些是经典的<strong>端口（Ports）</strong>——业务逻辑通过抽象接口调用，部署时注入不同的<strong>适配器（Adapters）</strong>。这就是六边形架构（Hexagonal Architecture）在计费场景的自然形态。</p>
+
+<h2 id="g2">G.2 公私差异矩阵（设计前提）</h2>
+
+<table>
+<thead><tr><th>维度</th><th>公有云</th><th>在线私有云 (A)</th><th>半离线 (B)</th><th>U 盘气隙 (C)</th><th>纯许可 (E)</th></tr></thead>
+<tbody>
+<tr><td>租户数</td><td>10K+</td><td>1~100</td><td>1~10</td><td>通常 1</td><td>通常 1</td></tr>
+<tr><td>余额来源</td><td>DB</td><td>License 镜像到 DB</td><td>License</td><td>License</td><td>License</td></tr>
+<tr><td>余额更新</td><td>实时充值</td><td>License 续期</td><td>License 续期</td><td>LRF 文件</td><td>新 License</td></tr>
+<tr><td>状态后端</td><td>Redis + PG</td><td>Redis + PG</td><td>嵌入式 KV + WAL</td><td>嵌入式 KV + WAL</td><td>嵌入式 KV + WAL</td></tr>
+<tr><td>用量上报</td><td>Kafka 实时</td><td>HTTPS 准实时</td><td>Bundle 上传</td><td>U 盘交换</td><td>无</td></tr>
+<tr><td>定价表</td><td>DB 表（可热更）</td><td>DB 表（中心下发）</td><td>License 内嵌</td><td>License 内嵌</td><td>License 内嵌</td></tr>
+<tr><td>时间源</td><td>NTP</td><td>NTP</td><td>NTP</td><td>本地 + TPM</td><td>本地 + TPM</td></tr>
+<tr><td>身份验证</td><td>OIDC / API Key</td><td>OIDC</td><td>本地 IDP</td><td>本地 IDP</td><td>本地 IDP</td></tr>
+<tr><td>HA 协调</td><td>Redis / Raft</td><td>Redis / Raft</td><td>etcd</td><td>NAS+flock</td><td>NAS+flock</td></tr>
+<tr><td>密钥管理</td><td>云 KMS</td><td>云 KMS / Vault</td><td>Vault</td><td>本地文件</td><td>本地文件 + TPM</td></tr>
+</tbody>
+</table>
+
+<p>共性比差异多得多——这正是"单代码库"成立的前提。</p>
+
+<h2 id="g3">G.3 分层架构（六边形 / Ports &amp; Adapters）</h2>
+
+<pre><code>┌────────────────────────────────────────────────────────────────┐
+│                    入站适配器 (Inbound)                        │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐   │
+│  │ HTTP REST   │  │ gRPC        │  │ Admin CLI / Audit   │   │
+│  └──────┬──────┘  └──────┬──────┘  └──────────┬──────────┘   │
+└─────────┼────────────────┼─────────────────────┼──────────────┘
+          │                │                     │
+          ▼                ▼                     ▼
+┌────────────────────────────────────────────────────────────────┐
+│            应用服务层 (Use Cases) ─ 100% 共享                  │
+│  HoldUsecase  CommitUsecase  CancelUsecase  AuditUsecase ...   │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│            领域模型 (Domain) ─ 100% 共享                       │
+│  Meter  Point  Hold  UsageRecord  License  PricingPlan  ...    │
+│  纯函数 + 不可变数据结构 + 无 IO                                 │
+└────────────────────────────────────────────────────────────────┘
+                              │
+        通过 Port 接口调用    │  （绝对不能直接 import 适配器）
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│              出站端口 (Ports) ─ 抽象接口定义                   │
+│  QuotaStore  UsageJournal  PricingSource  TimeSource           │
+│  MonotonicAnchor  EventPublisher  IdentityProvider  KeyStore   │
+└─────────────────────────┬──────────────────────────────────────┘
+                          │
+       ┌──────────────────┴──────────────────┐
+       ▼                                     ▼
+┌──────────────────────┐           ┌──────────────────────┐
+│  公有云适配器        │           │  私有云适配器        │
+│  - PgQuotaStore      │           │  - LicenseQuotaStore │
+│  - KafkaUsageJournal │           │  - WalUsageJournal   │
+│  - PgPricingSource   │           │  - LicensePricing    │
+│  - NtpTimeSource     │           │  - TpmTimeSource     │
+│  - RedisIdentity     │           │  - LocalIdentity     │
+│  - CloudKmsKeyStore  │           │  - FileKeyStore      │
+└──────────────────────┘           └──────────────────────┘
+</code></pre>
+
+<p><strong>关键约束</strong>：</p>
+
+<ol>
+<li>领域层 (Domain) 与应用层 (Use Cases) <strong>禁止 import 任何 IO 库</strong>（PG、Redis、TPM、HTTP client 等）。一行违规就会让"单代码库"承诺崩塌。</li>
+<li>所有 IO 通过 Port 接口调用，接口定义在领域层，实现位于适配器层。</li>
+<li>适配器之间互不感知——添加新适配器只需要实现端口，不需要改动现有代码。</li>
+<li>构建时通过依赖注入（DI）容器或显式 wire 把适配器装配到 Use Case。</li>
+</ol>
+
+<h2 id="g4">G.4 核心端口接口定义</h2>
+
+<p>下面用 Go 风格伪代码示意（其它语言等价）。这八个接口是公私模式的<strong>全部差异面</strong>——只要它们落实了，上层代码完全共享。</p>
+
+<pre><code>// ============================================
+// Port 1: QuotaStore - 余额读写
+// ============================================
+type QuotaStore interface {
+    Snapshot(tenantID string) (QuotaSnapshot, error)
+    Hold(ctx, op HoldOp) (HoldResult, error)
+    Commit(ctx, op CommitOp) (CommitResult, error)
+    Cancel(ctx, op CancelOp) error
+}
+// 实现：
+//   公有云 → PgQuotaStore (Redis 热 + PG 冷，Lua 原子)
+//   私有云 → LocalQuotaStore (BoltDB + 内存 actor)
+
+// ============================================
+// Port 2: UsageJournal - 用量流水持久化
+// ============================================
+type UsageJournal interface {
+    Append(ctx, record UsageRecord) error  // 同步 fsync
+    Replay(from Anchor, fn func(UsageRecord) error) error
+    DailyAnchor(date Date) (Anchor, error)
+}
+// 实现：
+//   公有云 → KafkaUsageJournal (异步高吞吐，最终入数仓)
+//   私有云 → WalUsageJournal   (本地段文件 + Merkle 链 + TPM)
+
+// ============================================
+// Port 3: PricingSource - 定价表加载
+// ============================================
+type PricingSource interface {
+    LoadActive(tenantID string, at time.Time) (PricingPlan, error)
+    LoadByVersion(version string) (PricingPlan, error)
+}
+// 实现：
+//   公有云 → DbPricingSource     (DB 表 + Redis 缓存，可热更)
+//   私有云 → LicenseEmbeddedPricing (从已加载 License 内提取)
+
+// ============================================
+// Port 4: TimeSource - 单调时间
+// ============================================
+type TimeSource interface {
+    Now() time.Time
+    AssertMonotonic() error   // 若回退超过阈值返回错误
+}
+// 实现：
+//   公有云 → NtpTimeSource (依赖系统 NTP，宽松)
+//   私有云 → AnchoredTimeSource (持久化 max_seen + heartbeat 校验)
+
+// ============================================
+// Port 5: MonotonicAnchor - 单调锚（防回滚）
+// ============================================
+type MonotonicAnchor interface {
+    Increment() (uint64, error)  // 返回严格递增的全局序号
+    Read() (uint64, error)
+}
+// 实现：
+//   公有云 → DbSequenceAnchor (PG sequence / Snowflake，无防回滚需求)
+//   私有云 → TpmNvAnchor (TPM NV counter，物理防回滚)
+//   降级   → FileLockAnchor (有 root 即可绕过，仅用于无 TPM 的开发环境)
+
+// ============================================
+// Port 6: EventPublisher - 副作用事件外发
+// ============================================
+type EventPublisher interface {
+    Publish(ctx, event Event) error
+}
+// 实现：
+//   公有云 → KafkaPublisher
+//   半离线 → BundlingPublisher (本地暂存，周期打包上传)
+//   纯许可 → NoopPublisher (空实现，编译期就 inline 掉)
+
+// ============================================
+// Port 7: IdentityProvider - 租户身份解析
+// ============================================
+type IdentityProvider interface {
+    Resolve(ctx, credentials) (Tenant, error)
+}
+// 实现：
+//   公有云 → JwtIdentityProvider
+//   私有云 → LicenseIdentityProvider (从 License 派生固定租户)
+
+// ============================================
+// Port 8: KeyStore - 签名密钥访问
+// ============================================
+type KeyStore interface {
+    Sign(keyID string, payload []byte) (Signature, error)
+    Verify(keyID string, payload, sig []byte) error
+    PublicKey(keyID string) (PublicKey, error)
+}
+// 实现：
+//   公有云 → CloudKmsKeyStore (AWS KMS / Aliyun KMS)
+//   私有云 → FileKeyStore + 可选 TPM seal
+</code></pre>
+
+<h2 id="g5">G.5 模式选择：构建时 vs 启动时</h2>
+
+<p>两种打包方式各有取舍：</p>
+
+<table>
+<thead><tr><th></th><th>构建时分离 (Build Tag)</th><th>启动时选择 (Runtime Config) <em>推荐</em></th></tr></thead>
+<tbody>
+<tr><td>实现方式</td><td><code>go build -tags=public</code> / <code>-tags=private</code></td><td>同一二进制，启动读 <code>BGW_MODE=public|private</code></td></tr>
+<tr><td>产物</td><td>两个二进制</td><td>一个二进制</td></tr>
+<tr><td>体积</td><td>各自精简</td><td>包含全部适配器（多 5~15 MB）</td></tr>
+<tr><td>CI</td><td>需要交叉构建矩阵</td><td>一次构建</td></tr>
+<tr><td>调试</td><td>难以在开发机模拟另一端</td><td>同一机器切换 mode 即可</td></tr>
+<tr><td>事故面</td><td>错装版本无法启动（明显）</td><td>错配 mode 启动可能跑错（需启动期校验）</td></tr>
+<tr><td>合规</td><td>可剥离云端代码不交付私有云</td><td>需法律评估能否交付完整二进制</td></tr>
+</tbody>
+</table>
+
+<p>多数场景推荐<strong>启动时选择</strong>，原因：</p>
+
+<ul>
+<li>开发体验远好于交叉构建——开发者本地用 <code>BGW_MODE=private+sqlite</code> 跑完整流程</li>
+<li>同一镜像可推到公有云和私有云的 registry，CI 一致</li>
+<li>合规风险通常可控（云端密钥不会随代码进入私有云，只是 KMS 适配器永远不会被实例化）</li>
+</ul>
+
+<p>若客户合同明确要求"私有云交付的二进制不得包含公有云上传相关代码"，则使用<strong>构建时分离</strong>，并通过 <code>//go:build private</code> 让 <code>KafkaUsageJournal</code> 这种文件在私有云构建中根本不存在。</p>
+
+<h2 id="g6">G.6 装配代码示例</h2>
+
+<pre><code>// cmd/billing-gateway/main.go
+func main() {
+    cfg := config.Load()  // 读取 BGW_MODE 与各项参数
+
+    deps := buildDependencies(cfg)
+    server := app.NewServer(deps)
+    server.Run()
+}
+
+func buildDependencies(cfg Config) Dependencies {
+    switch cfg.Mode {
+    case "public":
+        return Dependencies{
+            QuotaStore:      pg.NewQuotaStore(cfg.DSN, cfg.Redis),
+            UsageJournal:    kafka.NewJournal(cfg.Kafka),
+            PricingSource:   pg.NewPricingSource(cfg.DSN),
+            TimeSource:      ntp.New(),
+            MonotonicAnchor: db.NewSequenceAnchor(cfg.DSN),
+            EventPublisher:  kafka.NewPublisher(cfg.Kafka),
+            IdentityProvider: oidc.New(cfg.OIDC),
+            KeyStore:        cloudkms.New(cfg.KMSEndpoint),
+        }
+
+    case "private_online", "private_bundle":
+        return Dependencies{
+            QuotaStore:      local.NewQuotaStore(cfg.DataDir),
+            UsageJournal:    wal.NewJournal(cfg.DataDir),
+            PricingSource:   license.NewPricingSource(cfg.LicensePath),
+            TimeSource:      anchored.NewTimeSource(cfg.DataDir),
+            MonotonicAnchor: chooseAnchor(cfg),  // TPM 优先，降级文件锁
+            EventPublisher:  pickPublisher(cfg.Mode, cfg),
+            IdentityProvider: license.NewIdentityProvider(cfg.LicensePath),
+            KeyStore:        file.NewKeyStore(cfg.KeyDir),
+        }
+
+    case "private_airgap":
+        // 与 private_bundle 相同，但 EventPublisher 强制 NoopPublisher
+        // 且 PricingSource 必须从 License 派生
+        deps := buildDependencies(withMode(cfg, "private_bundle"))
+        deps.EventPublisher = noop.Publisher{}
+        return deps
+    }
+}
+
+// 应用层与领域层对所有上述选择无感知
+// app/usecase/commit.go
+func (u *CommitUseCase) Execute(ctx, req CommitRequest) (CommitResponse, error) {
+    // 整段代码两侧 100% 一致
+    plan, err := u.pricing.LoadByVersion(req.PricingVersion)
+    points := plan.Calculate(req.Items)
+    snap, _ := u.quota.Snapshot(req.TenantID)
+    if snap.Available() &lt; points { return ErrInsufficient }
+
+    seq, _ := u.anchor.Increment()
+    record := domain.NewUsageRecord(req, points, seq, u.time.Now())
+
+    if err := u.journal.Append(ctx, record); err != nil { return err }
+    if _, err := u.quota.Commit(ctx, ...); err != nil { return err }
+    _ = u.publisher.Publish(ctx, record.ToEvent())  // 私有云气隙模式下是 no-op
+    return CommitResponse{...}, nil
+}
+</code></pre>
+
+<h2 id="g7">G.7 测试策略：契约测试 + 双模式集成</h2>
+
+<p>单代码库最容易出问题的地方是<strong>"领域层不变但适配器行为差异导致 bug"</strong>。三层测试拦截：</p>
+
+<table>
+<thead><tr><th>层级</th><th>测试对象</th><th>跑几次</th></tr></thead>
+<tbody>
+<tr><td>领域/应用层单测</td><td>UseCase + Domain，依赖全部 mock</td><td>1 次</td></tr>
+<tr><td><strong>端口契约测试</strong></td><td>每个 Port 接口定义统一行为契约，所有实现必须通过</td><td>N 次（每实现一遍）</td></tr>
+<tr><td>模式集成测试</td><td>启动整套服务，端到端跑业务流</td><td>5 次（每种部署形态）</td></tr>
+</tbody>
+</table>
+
+<p>契约测试示例：</p>
+
+<pre><code>// internal/ports/contract/quota_contract.go
+func QuotaStoreContract(t *testing.T, factory func() QuotaStore) {
+    t.Run("hold_then_commit_decreases_balance", func(t *testing.T) {
+        q := factory()
+        q.Seed(tenant, 1000)
+        h, _ := q.Hold(ctx, HoldOp{Points: 200})
+        q.Commit(ctx, CommitOp{HoldID: h.ID, Actual: 150})
+        assert.Equal(t, 850, q.Snapshot(tenant).Available())
+    })
+    t.Run("expired_hold_is_released", func(t *testing.T) { ... })
+    t.Run("concurrent_holds_no_double_spend", func(t *testing.T) { ... })
+    t.Run("idempotent_commit", func(t *testing.T) { ... })
+    // ... 共 ~30 条契约
+}
+
+// 三个实现各自调用同一份契约
+func TestPgQuotaStore(t *testing.T)     { QuotaStoreContract(t, newPgFactory) }
+func TestLocalQuotaStore(t *testing.T)  { QuotaStoreContract(t, newLocalFactory) }
+func TestInMemQuotaStore(t *testing.T)  { QuotaStoreContract(t, newMemFactory) }
+</code></pre>
+
+<p>这种做法保证：任何一种实现行为偏离规约，CI 立刻红。<strong>领域层不需要任何 if mode == "private" 这种分支</strong>——这是衡量分层是否健康的最关键指标。</p>
+
+<h2 id="g8">G.8 部署形态 → 适配器选择映射</h2>
+
+<table>
+<thead><tr><th>Port</th><th>公有云</th><th>私有云在线</th><th>半离线</th><th>U 盘气隙</th><th>纯许可</th></tr></thead>
+<tbody>
+<tr><td>QuotaStore</td><td>PgQuotaStore</td><td>PgQuotaStore</td><td>LocalQuotaStore</td><td>LocalQuotaStore</td><td>LocalQuotaStore</td></tr>
+<tr><td>UsageJournal</td><td>KafkaJournal</td><td>HttpJournal</td><td>BundlingWalJournal</td><td>WalJournal</td><td>WalJournal</td></tr>
+<tr><td>PricingSource</td><td>PgPricing</td><td>RemoteSyncPricing</td><td>LicensePricing</td><td>LicensePricing</td><td>LicensePricing</td></tr>
+<tr><td>TimeSource</td><td>NtpTime</td><td>NtpTime</td><td>NtpTime</td><td>AnchoredTime</td><td>AnchoredTime</td></tr>
+<tr><td>MonotonicAnchor</td><td>DbSeqAnchor</td><td>DbSeqAnchor</td><td>TpmAnchor</td><td>TpmAnchor</td><td>TpmAnchor</td></tr>
+<tr><td>EventPublisher</td><td>KafkaPublisher</td><td>HttpsPublisher</td><td>BundlingPublisher</td><td>FileExportPublisher</td><td>NoopPublisher</td></tr>
+<tr><td>IdentityProvider</td><td>OidcIdentity</td><td>OidcIdentity</td><td>LocalIdpIdentity</td><td>LicenseIdentity</td><td>LicenseIdentity</td></tr>
+<tr><td>KeyStore</td><td>CloudKms</td><td>VaultKeyStore</td><td>VaultKeyStore</td><td>FileKeyStore+TPM</td><td>FileKeyStore+TPM</td></tr>
+</tbody>
+</table>
+
+<p>所有列共用上层 UseCase 与 Domain，差异收敛到底部适配器层 + 启动时的装配代码（约 200 行）。</p>
+
+<h2 id="g9">G.9 反模式与陷阱</h2>
+
+<table>
+<thead><tr><th>反模式</th><th>为什么糟糕</th><th>正确做法</th></tr></thead>
+<tbody>
+<tr><td><code>if isPrivateCloud() { ... } else { ... }</code> 散布在 UseCase 中</td><td>每加一种模式 N 个地方都要改；新人无法理解全貌</td><td>把差异提到 Port，让 UseCase 不感知</td></tr>
+<tr><td>领域层 import <code>github.com/aws/...</code> 或 <code>database/sql</code></td><td>领域逻辑被绑死，私有云构建直接失败或带入云依赖</td><td>领域层只能依赖标准库 + 自己定义的接口</td></tr>
+<tr><td>共享 Protobuf 中混入公有云专属字段</td><td>私有云客户审计代码时看到 <code>cloud_account_id</code> 会问"为什么这字段在我这"</td><td>对外协议分两组；内部领域模型只保留公共字段</td></tr>
+<tr><td>用配置开关控制业务语义差异</td><td><code>EnableHardLimit=true</code> 这种配置代表逻辑分支，本质是 if-else</td><td>用 Port + 不同 Adapter 表达；或用 Strategy 模式</td></tr>
+<tr><td>公有云专属功能直接调用 SDK</td><td>SDK 被 import 进 Use Case，私有云构建混入冗余</td><td>SDK 调用包裹在适配器内，UseCase 只依赖 Port</td></tr>
+<tr><td>测试只跑公有云路径（"私有云上线再测"）</td><td>真正交付时才发现 WAL 实现哈希链有 bug</td><td>CI 矩阵必须覆盖每种适配器，契约测试同跑</td></tr>
+<tr><td>License 解析逻辑写在主流程</td><td>公有云代码里夹着私有云逻辑，污染心智模型</td><td>License 解析是 <code>LicenseQuotaStore</code> / <code>LicensePricing</code> 内部细节</td></tr>
+<tr><td>把"私有云不需要 X"做成空表/空 DB</td><td>资源浪费 + 维护两套 schema 同步</td><td>用 NoopAdapter 编译期消除该路径</td></tr>
+</tbody>
+</table>
+
+<h2 id="g10">G.10 演进路径（强烈建议）</h2>
+
+<p>大多数团队都是<strong>先做了公有云，后要支持私有云</strong>。直接重构成上述架构成本高，建议分四阶段：</p>
+
+<ol>
+<li>
+<strong>阶段 1：识别端口（不改代码）</strong>
+<ul>
+<li>梳理出公有云代码里所有"会在私有云改写"的调用点（DB / Kafka / KMS / 时间 / 身份）</li>
+<li>画出未来私有云需要的实现，文档化对照表</li>
+<li>立即开始：所有<strong>新</strong>需求严格走 Port，老代码暂缓</li>
+</ul>
+</li>
+<li>
+<strong>阶段 2：抽取端口（无行为变化）</strong>
+<ul>
+<li>每周抽 1~2 个端口：定义 interface、把现有实现包成 Adapter、用 DI 替换直接调用</li>
+<li>每次抽取 PR 必须零业务行为变化，纯重构</li>
+<li>同时编写契约测试（即便此时只有一个实现，契约用于将来）</li>
+</ul>
+</li>
+<li>
+<strong>阶段 3：第一个私有云适配器（增量交付）</strong>
+<ul>
+<li>选最简单的形态先做（推荐"在线私有云" A 类，复用最多）</li>
+<li>实现 <code>LocalQuotaStore</code>、<code>WalUsageJournal</code> 等</li>
+<li>跑通契约测试，再跑模式集成测试</li>
+<li>第一个客户上线，反馈迭代</li>
+</ul>
+</li>
+<li>
+<strong>阶段 4：扩展到更严苛形态（边际成本递减）</strong>
+<ul>
+<li>添加 U 盘气隙、纯许可模式只需要替换 1~2 个适配器（如 Publisher 换成 NoopPublisher、Anchor 换成 TpmAnchor）</li>
+<li>领域层一行都不动</li>
+<li>新形态的边际开发成本应当显著低于第一个私有云形态——如果不是，说明分层抽象不够彻底，回到阶段 2 再抽几个端口</li>
+</ul>
+</li>
+</ol>
+
+<h2 id="g11">G.11 一句话总结</h2>
+
+<p>单代码库的关键不是"代码长得一样"，而是<strong>"业务逻辑层从不知道自己在哪种云上"</strong>。把所有"在不同云上长得不一样"的东西都关进端口/适配器的盒子里，领域层与用例层就能在公私两侧无差别复用——这才是真正意义的"一套代码"。</p>
+
+<hr />
+
+<h1 id="appendix-h">附录 H：降低各产线接入成本</h1>
+
+<p>前面几个附录解决的是<strong>计费网关自身</strong>如何在公私云统一。本附录解决另一个同样重要的问题：<strong>短信、LLM、TTS、图像、知识库检索等各条产线，如何用最小代价接入计费网关，并且接入方式在公有云和私有云完全一致</strong>——产线团队不应该感知到自己跑在哪种云上。</p>
+
+<h2 id="h1">H.1 接入成本到底来自哪里</h2>
+
+<p>"对接成本"不是单一数字，拆开看有六块，每一块都要单独压：</p>
+
+<table>
+<thead><tr><th>成本项</th><th>典型痛点</th><th>本附录对策</th></tr></thead>
+<tbody>
+<tr><td>学习成本</td><td>每个产线都要读懂 hold/commit/cancel、幂等、流式</td><td>统一 SDK 把概念封装成 2~3 个方法（H.3）</td></tr>
+<tr><td>编码成本</td><td>正确处理预扣、冲正、重试、超时要写上百行</td><td>SDK / Sidecar / 拦截器三档接入（H.2）</td></tr>
+<tr><td>计量成本</td><td>token 怎么数、SMS 怎么算、各产线各写一套</td><td>计量提取器标准库（H.6）</td></tr>
+<tr><td>公私差异成本</td><td>担心私有云要改接入代码</td><td>SDK 屏蔽 endpoint 形态，产线零改动（H.3.2）</td></tr>
+<tr><td>测试成本</td><td>没有计费环境无法联调</td><td>沙箱 + Mock + doctor 自检（H.9）</td></tr>
+<tr><td>维护成本</td><td>计费网关升级，产线被迫跟着改</td><td>协议版本化 + 兼容契约（H.12）</td></tr>
+</tbody>
+</table>
+
+<h2 id="h2">H.2 三档接入方式（按侵入度自选）</h2>
+
+<p>不强制所有产线用同一种接入方式——给三档，让产线按自己的技术栈和侵入容忍度选：</p>
+
+<table>
+<thead><tr><th>档位</th><th>方式</th><th>产线改动量</th><th>适用</th></tr></thead>
+<tbody>
+<tr>
+<td><strong>档 1：SDK 内嵌</strong></td>
+<td>引入计费 SDK，在业务代码里显式调用</td>
+<td>~5~15 行</td>
+<td>需要精细控制（流式、跨 meter 组合、动态定价）</td>
+</tr>
+<tr>
+<td><strong>档 2：Sidecar 透明代理</strong></td>
+<td>旁挂一个 billing-sidecar，拦截进出流量自动计费</td>
+<td><strong>0 行业务代码</strong>（只加部署配置）</td>
+<td>标准 HTTP/gRPC 产线，计量可从请求/响应自动提取</td>
+</tr>
+<tr>
+<td><strong>档 3：框架中间件</strong></td>
+<td>引入 HTTP middleware / gRPC interceptor</td>
+<td>~1 行（注册中间件）</td>
+<td>用主流框架、希望声明式但不想加 Sidecar</td>
+</tr>
+</tbody>
+</table>
+
+<pre><code>侵入度：  档1 SDK  &gt;  档3 中间件  &gt;  档2 Sidecar
+控制力：  档1 SDK  &gt;  档3 中间件  &gt;  档2 Sidecar
+推荐默认：标准产线用 档2/档3，特殊产线用 档1
+</code></pre>
+
+<h2 id="h3">H.3 统一接入 SDK 设计</h2>
+
+<h3>H.3.1 把五个概念压成两个方法</h3>
+
+<p>产线不需要理解 hold/commit/cancel/idempotency/streaming——SDK 用一个 <code>Charge</code> 装饰器 / 上下文管理器收口：</p>
+
+<pre><code>// Go：同步调用
+result, err := billing.Charge(ctx, billing.Meter("sms.cn.normal"), 1,
+    func() (Response, Usage, error) {
+        resp := sendSMS(req)                 // 产线真实业务
+        return resp, billing.Units(1), nil   // 报告实际用量
+    })
+// SDK 内部自动完成：pre-check → hold → 执行 → commit(实际) → 失败 cancel
+
+# Python：上下文管理器
+with billing.charge(meter="llm.gpt4o", estimate=est_tokens(req)) as bill:
+    resp = call_llm(req)
+    bill.actual(input=resp.usage.input, output=resp.usage.output)
+# 退出 with 块自动 commit；抛异常自动 cancel
+</code></pre>
+
+<pre><code>// TypeScript：高阶函数
+const resp = await billing.charge(
+  { meter: "tts.zh", estimate: estimateSeconds(req) },
+  async (bill) =&gt; {
+    const audio = await synthesize(req);
+    bill.actual(audio.durationSec);
+    return audio;
+  }
+);
+</code></pre>
+
+<p>SDK 替产线兜住的全部脏活：</p>
+
+<ul>
+<li>预检 + 预扣（hold），余额不足直接抛 <code>InsufficientPointsError</code></li>
+<li>业务成功 → 用实际用量 commit；多退少补自动算</li>
+<li>业务抛异常 / panic / 超时 → 自动 cancel，释放预扣</li>
+<li>幂等键自动生成（基于 request_id），网络重试不重复扣费</li>
+<li>commit 网络抖动 → 退避重试，仍失败则进本地补偿队列</li>
+<li>埋点 metric / trace 自动打</li>
+</ul>
+
+<h3>H.3.2 公私云对产线完全透明</h3>
+
+<p>这是降低成本的<strong>最关键一点</strong>。SDK 的 <code>Target</code> 解析隐藏了"计费网关在哪"：</p>
+
+<pre><code>┌──────────── 产线进程 ────────────┐
+│  业务代码（永远不变）             │
+│        │ billing.Charge(...)      │
+│        ▼                          │
+│   Billing SDK                     │
+│        │ 按环境解析 Target        │
+└────────┼──────────────────────────┘
+         │
+   ┌─────┴─────────────────────────────────────┐
+   ▼                ▼                ▼           ▼
+ 公有云           私有云在线       气隙          单测
+ 远程 gRPC        本地 gRPC      同进程 in-proc   in-memory
+ billing.svc      localhost      Unix socket     fake
+ :443             :8080          /run/bgw.sock
+</code></pre>
+
+<p>产线代码完全不变，只是部署时注入不同的 <code>BILLING_TARGET</code>：</p>
+
+<table>
+<thead><tr><th>部署</th><th>BILLING_TARGET</th><th>传输</th></tr></thead>
+<tbody>
+<tr><td>公有云</td><td><code>grpcs://billing.internal:443</code></td><td>mTLS gRPC</td></tr>
+<tr><td>私有云在线</td><td><code>grpc://localhost:8080</code></td><td>本地 gRPC</td></tr>
+<tr><td>气隙（同机部署）</td><td><code>unix:///run/bgw.sock</code></td><td>Unix domain socket</td></tr>
+<tr><td>极致低延迟</td><td><code>inproc://</code></td><td>SDK 直接 link 计费库，进程内调用</td></tr>
+<tr><td>开发 / 单测</td><td><code>mock://</code></td><td>内存 fake，给定额度</td></tr>
+</tbody>
+</table>
+
+<p>SDK 暴露的接口在所有 Target 下行为一致（由附录 G 的端口契约测试保证）。产线团队接入一次，公有云和私有云<strong>同一份代码、同一个镜像</strong>跑通。</p>
+
+<h2 id="h4">H.4 声明式 Meter 清单（Meter Manifest）</h2>
+
+<p>不要让产线在代码里硬编码 meter 字符串和计费单位——容易写错、改价要改代码。改成<strong>声明式清单 + 启动注册</strong>：</p>
+
+<pre><code># 产线仓库内 billing-meters.yaml
+product_line: sms-service
+version: 1
+meters:
+  - code: sms.cn.normal
+    display: 国内普通短信
+    raw_unit: message          # 计量单位
+    extractor: count.request_field
+    extractor_config:
+      field: $.recipients[*]    # 从请求里数收件人个数
+  - code: sms.cn.marketing
+    display: 国内营销短信
+    raw_unit: message
+    extractor: count.request_field
+    extractor_config:
+      field: $.recipients[*]
+  - code: sms.intl
+    display: 国际短信
+    raw_unit: message
+    dimensions: [region]        # 按地区分档，价格由计费侧定
+</code></pre>
+
+<p>启动时 SDK 自动把清单注册到计费网关（公有云注册到中心、私有云校验是否在 License 的 <code>meters_allowed</code> 内）。<strong>价格永远不在产线侧</strong>——产线只声明"我有哪些可计费动作、怎么数量"，"一个动作值多少点"由计费侧的 Pricing Plan / License 决定。这样改价不需要产线发版。</p>
+
+<h2 id="h5">H.5 Sidecar 透明代理（零代码接入）</h2>
+
+<p>对标准 HTTP/gRPC 产线，最低成本是<strong>完全不改代码</strong>，旁挂 Sidecar：</p>
+
+<pre><code>          ┌─────────────── Pod / 同机 ───────────────┐
+ client ──►│ billing-sidecar :8000 ──► 产线服务 :9000 │
+          │       │  1. 拦截请求，按 manifest 提取计量  │
+          │       │  2. 调本地/远程计费网关 hold        │
+          │       │  3. 转发给产线服务                  │
+          │       │  4. 拦截响应，提取实际用量          │
+          │       │  5. commit（失败则 cancel）         │
+          │       │  6. 把响应返回 client               │
+          └────────────────────────────────────────────┘
+</code></pre>
+
+<p>Sidecar 配置完全声明式：</p>
+
+<pre><code># sidecar.yaml
+upstream: http://127.0.0.1:9000
+billing_target: ${BILLING_TARGET}    # 公私云只改这一个
+routes:
+  - match: { path: /v1/sms/send, method: POST }
+    meter: sms.cn.normal
+    estimate: { extractor: count.json, path: $.recipients[*] }
+    actual:   { extractor: count.json, path: $.recipients[*] }
+  - match: { path: /v1/chat/completions, method: POST }
+    meter: llm.gpt4o
+    estimate: { extractor: llm.max_tokens }       # 用 max_tokens 预扣
+    actual:   { extractor: llm.openai_usage }      # 从响应 usage 字段读真实值
+    streaming: sse                                 # 自动处理流式
+</code></pre>
+
+<p>适用边界：计量值能从请求/响应里<strong>结构化提取</strong>的产线适合 Sidecar；如果计量逻辑很动态（如按生成图片的复杂度算），用 SDK 档位更合适。</p>
+
+<h2 id="h6">H.6 计量提取器标准库（Metering Extractors）</h2>
+
+<p>"怎么数量"是每条产线最容易各写一套、各写各错的地方。把常见模式做成<strong>内置提取器</strong>，产线选用而非自研：</p>
+
+<table>
+<thead><tr><th>提取器</th><th>用途</th><th>示例</th></tr></thead>
+<tbody>
+<tr><td><code>count.json</code></td><td>数 JSONPath 命中数</td><td>SMS 收件人数、批量请求条数</td></tr>
+<tr><td><code>llm.openai_usage</code></td><td>解析 OpenAI 风格 <code>usage</code> 字段</td><td>input/output tokens</td></tr>
+<tr><td><code>llm.anthropic_usage</code></td><td>解析 Anthropic 风格 usage</td><td>含 cache_read / cache_write tokens</td></tr>
+<tr><td><code>llm.max_tokens</code></td><td>预扣阶段用 max_tokens 上界</td><td>hold 估算</td></tr>
+<tr><td><code>llm.local_tokenizer</code></td><td>本地 tokenizer 精确计数（私有模型无 usage 字段时）</td><td>自研模型计费</td></tr>
+<tr><td><code>audio.duration</code></td><td>从音频时长算</td><td>TTS / ASR 秒数</td></tr>
+<tr><td><code>image.spec</code></td><td>按分辨率 × 张数 × 步数</td><td>文生图</td></tr>
+<tr><td><code>weight.const</code></td><td>固定权重</td><td>一次检索固定 N 点</td></tr>
+<tr><td><code>header.field</code></td><td>从响应头读用量</td><td>上游已算好用量的代理场景</td></tr>
+</tbody>
+</table>
+
+<p>提取器是公私云共享的纯函数（无 IO），同样跑契约测试。产线 95% 场景靠选配置完成计量，无需写代码。剩余 5% 特殊场景实现 <code>Extractor</code> 接口（一个方法）即可。</p>
+
+<h2 id="h7">H.7 流式与异步场景的封装</h2>
+
+<p>流式（LLM SSE、TTS 流式合成）是产线最容易做错的地方，SDK 必须封装好：</p>
+
+<pre><code>// 产线只管吐 chunk，计费由 SDK 滚动处理
+stream := billing.ChargeStream(ctx, billing.Meter("llm.gpt4o"),
+    billing.Estimate(maxTokens))
+defer stream.Close()   // 自动 finalize：已生成的 commit，未用的退还
+
+for chunk := range llmStream {
+    stream.Observe(chunk.Tokens)   // SDK 内部滚动 hold/partial-commit
+    send(chunk)
+}
+// 客户端中途断开 → defer Close 把已生成部分 commit、剩余 hold cancel
+</code></pre>
+
+<p>异步任务（如批量图像生成、离线转写）用回执模式：</p>
+
+<pre><code>ticket := billing.ChargeAsync(ctx, meter, estimate)   // 先 hold，返回票据
+// ... 任务进入队列，几分钟后完成 ...
+billing.Finalize(ticket.ID, actualUsage)              // 完成时 commit
+// 任务失败/超时由 SDK 的 reaper 自动 cancel 过期票据
+</code></pre>
+
+<h2 id="h8">H.8 统一错误语义与重试</h2>
+
+<p>各产线最怕"计费返回个错误，不知道该重试还是该放弃"。SDK 把错误归一成三类，每类有明确动作：</p>
+
+<table>
+<thead><tr><th>错误类</th><th>含义</th><th>SDK 默认动作</th><th>产线该做</th></tr></thead>
+<tbody>
+<tr><td><code>BillingDenied</code></td><td>余额不足 / 许可过期 / meter 未授权</td><td>立即抛出，不重试</td><td>向终端用户返回 402 + 升级引导</td></tr>
+<tr><td><code>BillingUnavailable</code></td><td>计费网关临时不可达</td><td>退避重试 N 次，仍失败按 fail-policy</td><td>通常无需处理</td></tr>
+<tr><td><code>BillingInternal</code></td><td>计费侧 bug / 数据异常</td><td>记录 + 告警，按 fail-policy</td><td>无需处理，等修复</td></tr>
+</tbody>
+</table>
+
+<p><code>fail-policy</code> 是产线可配的关键策略（计费网关短暂不可用时怎么办）：</p>
+
+<pre><code>fail_policy:
+  on_unavailable: fail_open | fail_closed | local_queue
+    # fail_open   : 放行业务，用量进本地补偿队列，恢复后补扣（重可用性）
+    # fail_closed : 拒绝业务，返回 503（重计费准确，金融/计量严格场景）
+    # local_queue : 私有云推荐——本地 WAL 本就不依赖中心，直接落账
+</code></pre>
+
+<p>私有云因为计费就在本地（甚至同进程），<code>BillingUnavailable</code> 几乎不会发生，<code>fail-policy</code> 主要服务公有云的网络抖动。产线配一次，公私通用。</p>
+
+<h2 id="h9">H.9 接入自检、沙箱与 Mock</h2>
+
+<p>让产线<strong>在没有真实计费环境时也能完成 90% 联调</strong>，是降低对接成本的关键：</p>
+
+<table>
+<thead><tr><th>工具</th><th>作用</th></tr></thead>
+<tbody>
+<tr><td><code>billing doctor</code></td><td>静态检查 manifest 合法性、meter 命名规范、extractor 配置可解析、与计费网关连通性</td></tr>
+<tr><td>Mock Target (<code>mock://</code>)</td><td>SDK 内存实现，给定初始额度，单测里完整跑 hold/commit/cancel，无需任何外部依赖</td></tr>
+<tr><td>Sandbox 计费网关</td><td>独立部署的"演练环境"，行为与生产一致但用虚拟点数，可随意造数据</td></tr>
+<tr><td>Replay 校验</td><td>录制产线生产流量，回放到 sandbox，比对计费结果，上线前发现计量偏差</td></tr>
+<tr><td>计量 lint</td><td>对接评审时自动检查：是否所有可计费接口都接了计费、有没有遗漏的免费后门</td></tr>
+</tbody>
+</table>
+
+<pre><code>$ billing doctor
+[OK]   billing-meters.yaml 语法合法
+[OK]   3 个 meter 命名符合规范 (sms.cn.normal, ...)
+[OK]   extractor 'count.json' 配置可解析
+[WARN] meter 'sms.intl' 声明了 dimension [region] 但路由未提供提取规则
+[OK]   连通性: mock:// 可用
+[INFO] 生产 Target 未配置（开发环境正常）
+集成就绪度: 90%（修复 1 个 WARN 后达 100%）
+</code></pre>
+
+<h2 id="h10">H.10 多语言 SDK 的一致性保障</h2>
+
+<p>产线用 Go / Java / Python / Node / Rust 各不相同。多语言 SDK 最大风险是<strong>行为漂移</strong>（Python SDK 的重试逻辑和 Go 的不一样）。三个手段保证一致：</p>
+
+<ol>
+<li><strong>协议优先</strong>：hold/commit/cancel 用 Protobuf + gRPC 定义，所有 SDK 从同一份 <code>.proto</code> 生成传输层，杜绝手写协议分歧。</li>
+<li><strong>共享行为契约测试集</strong>：一份语言无关的契约测试用例（YAML 描述的场景 + 期望），每个 SDK 都跑同一套，CI 强制通过。例如"hold 后业务抛异常 → 必须发出 cancel"。</li>
+<li><strong>薄 SDK 原则</strong>：复杂逻辑（计量、定价、状态机）尽量下沉到计费网关，SDK 只做"调用 + 重试 + 幂等 + 提取器"这层薄封装。SDK 越薄，多语言一致性越容易保证。</li>
+</ol>
+
+<pre><code>          ┌─────────── 单一 .proto + 契约用例 ───────────┐
+          ▼            ▼            ▼            ▼
+       Go SDK      Java SDK     Python SDK    Node SDK
+          │            │            │            │
+          └────────────┴─── 同一套契约测试 ──┴────────────┘
+                       全部 CI 绿才允许发布
+</code></pre>
+
+<h2 id="h11">H.11 接入 Checklist 与典型工时</h2>
+
+<table>
+<thead><tr><th>步骤</th><th>SDK 档</th><th>Sidecar 档</th></tr></thead>
+<tbody>
+<tr><td>1. 写 <code>billing-meters.yaml</code></td><td>~0.5h</td><td>~0.5h</td></tr>
+<tr><td>2. 选/配计量提取器</td><td>~0.5h</td><td>~0.5h</td></tr>
+<tr><td>3. 业务代码接入</td><td>~1h（包几个调用）</td><td>0h（不改代码）</td></tr>
+<tr><td>4. 配置 fail-policy</td><td>~0.2h</td><td>~0.2h</td></tr>
+<tr><td>5. <code>billing doctor</code> + Mock 单测</td><td>~1h</td><td>~0.5h</td></tr>
+<tr><td>6. Sandbox 联调 + Replay 校验</td><td>~1h</td><td>~1h</td></tr>
+<tr><td><strong>合计</strong></td><td><strong>~0.5 人日</strong></td><td><strong>~0.3 人日</strong></td></tr>
+<tr><td>公有云 → 私有云额外成本</td><td colspan="2"><strong>0</strong>（只改 BILLING_TARGET 环境变量）</td></tr>
+</tbody>
+</table>
+
+<h2 id="h12">H.12 协议版本化与向后兼容</h2>
+
+<p>降低对接成本不止于"首次接入快"，更要保证<strong>计费网关升级不逼产线跟着发版</strong>：</p>
+
+<ul>
+<li><strong>Proto 只增不改</strong>：字段只追加、不复用 tag、不改语义；废弃字段标 <code>deprecated</code> 保留。</li>
+<li><strong>SDK 与网关版本协商</strong>：握手时交换能力集，新功能对老 SDK 自动降级。</li>
+<li><strong>meter / 定价变更不影响产线</strong>：价格在计费侧，产线无感；新增 meter 维度走清单声明，老 meter 不动。</li>
+<li><strong>N-2 兼容承诺</strong>：网关至少兼容前两个大版本的 SDK，给产线充足升级窗口。</li>
+<li><strong>契约测试护栏</strong>：任何破坏兼容的改动会让历史契约用例失败，CI 直接拦下。</li>
+</ul>
+
+<h2 id="h13">H.13 一句话总结</h2>
+
+<p>降低产线对接成本的核心是<strong>三个"不应该"</strong>：产线不应该感知公私云差异（SDK 屏蔽 Target）、产线不应该关心点数定价（只声明 meter 与计量、价格在计费侧）、产线不应该重复实现计费正确性（hold/commit/重试/幂等/流式全在 SDK 与 Sidecar 里）。做到这三点，新产线接入从"周"压到"半天"，且公有云接入完即私有云接入完。</p>
+
+<hr />
+
+<h1 id="appendix-i">附录 I：统一计量计费管道</h1>
+
+<p>前面各附录分别解决了点数模型、公私云、离线、单代码库、产线接入。本附录把它们<strong>串成一条端到端的统一管道</strong>，回答："来自任意产线、任意云形态的用量，如何走<strong>同一条</strong>计量→计费链路，得到一致、可对账、可分析的结果"。统一是目标，前面所有设计都是为它服务的。</p>
+
+<h2 id="i1">I.1 为什么必须"统一"</h2>
+
+<p>不统一的典型恶果：短信团队自己算钱、LLM 团队自己扣费、私有云又是另一套脚本——结果是<strong>对账对不齐、口径各不同、改价要改 N 处、新产线重复造轮子</strong>。统一计量计费要消灭三种异构：</p>
+
+<table>
+<thead><tr><th>异构</th><th>不统一的后果</th><th>统一手段</th></tr></thead>
+<tbody>
+<tr><td>计量源异构</td><td>SMS 按条、LLM 按 token、TTS 按秒，各产线各报各的</td><td>统一事件模型 UsageEvent（I.3）</td></tr>
+<tr><td>计费口径异构</td><td>有的按元、有的按次、私有云按 License，对账无法合并</td><td>统一点数 + 统一计价引擎（I.6）</td></tr>
+<tr><td>部署形态异构</td><td>公有云实时、私有云离线，两套计量管道</td><td>同一管道、末端适配（I.13）</td></tr>
+</tbody>
+</table>
+
+<h2 id="i2">I.2 六段式统一管道</h2>
+
+<p>所有用量，无论来自哪条产线、哪种云，都流经同一条六段管道：</p>
+
+<pre><code>┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
+│ ①计量   │─►│ ②归一   │─►│ ③计价   │─►│ ④计费   │─►│ ⑤结算   │─►│ ⑥对账   │
+│ Metering │  │Normalize │  │ Pricing  │  │ Charging │  │ Settle   │  │ Reconcile│
+└──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘
+ 采集/去重    原始单位→     标准单位→     点数→余额     点数→账单     计量vs计费
+ /聚合        标准计量单位   点数          扣减(hold/                  一致性闭环
+                                          commit)
+   │             │             │             │             │             │
+   产线/Sidecar  计量提取器    Pricing Plan  QuotaStore   Settlement   Audit/Merkle
+                              /License内嵌   (公私适配)    Engine
+</code></pre>
+
+<table>
+<thead><tr><th>段</th><th>输入</th><th>输出</th><th>职责</th></tr></thead>
+<tbody>
+<tr><td>①计量 Metering</td><td>业务调用</td><td>原始用量事件</td><td>采集、去重、按窗口聚合</td></tr>
+<tr><td>②归一 Normalize</td><td>原始用量（条/token/秒）</td><td>标准计量单位</td><td>统一量纲、补全维度</td></tr>
+<tr><td>③计价 Pricing</td><td>标准计量单位</td><td>点数</td><td>查 Pricing Plan / License 折算</td></tr>
+<tr><td>④计费 Charging</td><td>点数</td><td>余额变更</td><td>hold/commit/cancel</td></tr>
+<tr><td>⑤结算 Settlement</td><td>点数流水</td><td>账单</td><td>周期汇总、分摊、出账</td></tr>
+<tr><td>⑥对账 Reconcile</td><td>计量 + 计费记录</td><td>差异报告</td><td>一致性校验、闭环</td></tr>
+</tbody>
+</table>
+
+<p><strong>关键</strong>：计量与计费之间用②③解耦——产线只管"用了多少原始单位"（①②），平台负责"折多少点、扣多少钱"（③④）。改价只动③，产线和计量层完全不感知。</p>
+
+<h2 id="i3">I.3 统一事件模型 UsageEvent</h2>
+
+<p>整条管道的"普通话"是一个 canonical 事件结构。所有产线、所有云，最终都产出它——这是统一的基石：</p>
+
+<pre><code>message UsageEvent {
+  // ===== 身份维度（谁用的）=====
+  string event_id     = 1;   // 全局唯一，幂等键
+  string tenant_id    = 2;
+  string product_line = 3;   // sms / llm / tts / image ...
+  string deployment_id= 4;   // 公有云为空；私有云实例标识
+
+  // ===== 计量维度（用了什么、多少）=====
+  string meter_code   = 5;   // llm.gpt4o.output
+  double raw_usage    = 6;   // 481
+  string raw_unit     = 7;   // token
+  map&lt;string,string&gt; dimensions = 8;  // {region:cn, model:gpt4o, ...}
+
+  // ===== 计价快照（按什么价算的）=====
+  string pricing_version = 9;
+  double points          = 10; // 计价后落定的点数（计价前为空）
+
+  // ===== 上下文 =====
+  string request_id   = 11;
+  Timestamp occurred_at = 12;
+  string trace_id     = 13;
+
+  // ===== 完整性（私有云用）=====
+  string prev_hash    = 14;
+  string this_hash    = 15;
+  uint64 monotonic_seq= 16;  // TPM 锚定序号
+}
+</code></pre>
+
+<p>同一个 UsageEvent 贯穿全程：①计量产出（points 为空）→ ③计价填入 points → ④计费引用它扣减 → ⑤结算聚合它 → ⑥对账校验它。一条数据，六段复用，<strong>不存在"计量数据"和"计费数据"两份会漂移的副本</strong>。</p>
+
+<h2 id="i4">I.4 ①计量层：采集 / 去重 / 聚合</h2>
+
+<ul>
+<li><strong>采集</strong>：来源统一为附录 H 的三档（SDK / Sidecar / 中间件），产出 UsageEvent。</li>
+<li><strong>去重</strong>：以 <code>event_id</code> 为幂等键，重试 / 网络重发不重复计量。公有云用 Redis SETNX 窗口去重，私有云用 WAL 的 request_id 索引。</li>
+<li><strong>聚合</strong>：高频小额场景（如逐 token 计量）按"租户+meter+时间窗"预聚合再入计价，降低下游压力。聚合是可选优化，不改变语义。</li>
+</ul>
+
+<pre><code>原始调用 → UsageEvent(raw) → [去重网关] → [可选聚合窗口] → 入②归一
+                                  │
+                                  └─ 已见过的 event_id 直接丢弃
+</code></pre>
+
+<h2 id="i5">I.5 ②归一层：原始单位 → 标准计量单位</h2>
+
+<p>不同产线的 raw_unit 五花八门，归一层把它们映射到<strong>标准计量单位（SMU, Standard Metering Unit）</strong>，让后续计价只面对有限几种量纲：</p>
+
+<table>
+<thead><tr><th>产线 raw_unit</th><th>标准计量单位 SMU</th><th>归一规则</th></tr></thead>
+<tbody>
+<tr><td>token</td><td>kilotoken</td><td>raw / 1000</td></tr>
+<tr><td>message（短信）</td><td>message（长短信按 67 字拆分计 N 条）</td><td>ceil(len / seg_size)</td></tr>
+<tr><td>second（音频）</td><td>second</td><td>1:1</td></tr>
+<tr><td>image</td><td>image-unit（按分辨率档加权）</td><td>base × resolution_factor × steps</td></tr>
+<tr><td>request（检索）</td><td>call</td><td>1:1</td></tr>
+</tbody>
+</table>
+
+<p>归一同时做<strong>维度补全</strong>：把 region、model、edition 等补进 <code>dimensions</code>，供计价做分档。归一规则是纯函数，公私共享、跑契约测试。</p>
+
+<h2 id="i6">I.6 ③计价层：统一计价引擎</h2>
+
+<p>整个平台<strong>只有一个计价引擎</strong>，输入 (SMU, dimensions, pricing_version)，输出 points。公私云的差异仅在"价目表从哪来"（附录 G 的 <code>PricingSource</code> 端口）：</p>
+
+<pre><code>points = PricingEngine.calc(
+    smu_value,            // 标准计量单位数量
+    dimensions,           // 分档维度
+    plan = PricingSource.load(tenant, pricing_version)
+)
+// 公有云：PricingSource = DB 表（可热更、可灰度）
+// 私有云：PricingSource = License 内嵌价目表（签名锁定、不可改）
+</code></pre>
+
+<p>计价引擎本身是公私<strong>逐字节相同</strong>的纯函数——这保证了"同样的用量，在公有云和私有云算出同样的点数"，这是统一计费可信的核心。计价结果（points + pricing_version）回填进 UsageEvent，从此点数就是不可变的既定事实。</p>
+
+<h2 id="i7">I.7 ④计费层：点数 → 余额扣减</h2>
+
+<p>计费层就是附录 A 的 hold/commit/cancel 状态机 + 附录 G 的 <code>QuotaStore</code> 端口。无论公私，<strong>计费引擎看到的只是点数</strong>，不关心这点数来自短信还是 token——这正是点数抽象的价值。</p>
+
+<pre><code>UsageEvent(points=712) ──► Charging
+                              │ QuotaStore.Commit
+              ┌───────────────┴───────────────┐
+         公有云 PgQuotaStore            私有云 LocalQuotaStore
+         Redis+PG 实时扣减               BoltDB+WAL 本地扣减
+</code></pre>
+
+<h2 id="i8">I.8 ⑤结算层：点数 → 账单</h2>
+
+<ul>
+<li><strong>周期汇总</strong>：按租户 × 产线 × meter × 账期聚合点数，生成结算单。</li>
+<li><strong>成本分摊</strong>：基于 dimensions（如部门 Header）做内部分账。</li>
+<li><strong>点数 ↔ 钱</strong>：仅在结算层做最终换算（点数单价由套餐决定），前面全程用点数避免汇率/税率污染。</li>
+<li><strong>公私一致</strong>：公有云实时出账；私有云在线/半离线周期出账；纯许可模式不出账（许可即收据，见附录 E）。</li>
+</ul>
+
+<h2 id="i9">I.9 ⑥对账层：计量与计费一致性闭环</h2>
+
+<p>"统一"最终要靠对账兜底——证明<strong>计量出来的</strong>和<strong>计费扣掉的</strong>分毫不差：</p>
+
+<pre><code>对账等式（任意账期、任意租户均须成立）：
+  Σ UsageEvent.points (计量侧产出)
+    == Σ QuotaStore 扣减 (计费侧)
+    == Σ Settlement 出账点数 (结算侧)
+
+三方不等 → 触发差异定位：
+  按 meter / 产线 / 时间窗逐层下钻，定位到具体 event_id
+</code></pre>
+
+<table>
+<thead><tr><th>形态</th><th>对账方式</th></tr></thead>
+<tbody>
+<tr><td>公有云</td><td>实时流对账 + 每日批对账（计量流水 vs 余额变更 vs 账单）</td></tr>
+<tr><td>私有云在线/半离线</td><td>上报的 UsageEvent vs 中心结算，周期对账</td></tr>
+<tr><td>U 盘气隙</td><td>导出包内的 Merkle root vs 中心导入后重算</td></tr>
+<tr><td>纯许可</td><td>客户单方对账（本地计量 vs 本地扣减），厂商不参与（附录 E.6）</td></tr>
+</tbody>
+</table>
+
+<h2 id="i10">I.10 实时与批量的统一</h2>
+
+<p>计量计费天然有"实时扣费"和"批量结算/分析"两种诉求。不应该为它们建两套管道，而用<strong>同一份 UsageEvent 流，两种消费者</strong>（Kappa 架构）：</p>
+
+<pre><code>                        ┌──► 实时消费者：Charging（扣余额、限额拦截）
+UsageEvent 流 (统一日志) ─┤
+                        └──► 批量消费者：Settlement / 数仓 / BI 分析
+</code></pre>
+
+<ul>
+<li><strong>公有云</strong>：统一日志 = Kafka；实时扣费走流处理，结算/分析走数仓。</li>
+<li><strong>私有云</strong>：统一日志 = 本地 WAL；实时扣费走内存 actor，结算走 WAL 回放聚合。</li>
+<li>两种消费者读<strong>同一份事件</strong>，不会出现"实时扣的"和"批量算的"对不上——因为它们本就是同一条数据。</li>
+</ul>
+
+<h2 id="i11">I.11 多维聚合：一份数据，多种用途</h2>
+
+<p>统一 UsageEvent 带齐了维度（tenant / product_line / meter / dimensions / time），一次落账即可支撑多种视图，无需各业务重复埋点：</p>
+
+<table>
+<thead><tr><th>聚合维度</th><th>用途</th></tr></thead>
+<tbody>
+<tr><td>tenant × 账期</td><td>客户账单</td></tr>
+<tr><td>product_line × 账期</td><td>产线收入 / 成本归因</td></tr>
+<tr><td>meter × 时间窗</td><td>容量规划、异常用量告警</td></tr>
+<tr><td>dimensions.dept × 账期</td><td>客户内部分摊（私有云常见）</td></tr>
+<tr><td>region × meter</td><td>区域定价优化</td></tr>
+<tr><td>tenant × meter（环比）</td><td>用量突增风控、欺诈检测</td></tr>
+</tbody>
+</table>
+
+<h2 id="i12">I.12 计量计费一致性保障</h2>
+
+<table>
+<thead><tr><th>风险</th><th>保障手段</th></tr></thead>
+<tbody>
+<tr><td>计量丢失（用了没算）</td><td>SDK/Sidecar 强制路径 + 计量 lint 检查无免费后门（附录 H.9）</td></tr>
+<tr><td>重复计量（算两次）</td><td>event_id 全局幂等去重</td></tr>
+<tr><td>计量与计费漂移</td><td>同一 UsageEvent 贯穿全程，无两份副本</td></tr>
+<tr><td>计价口径不一致</td><td>单一计价引擎纯函数，公私逐字节相同</td></tr>
+<tr><td>历史不可重算</td><td>pricing_version 落在每条事件上，可按任意版本重算</td></tr>
+<tr><td>私有云篡改</td><td>this_hash / prev_hash / monotonic_seq（附录 B、F）</td></tr>
+<tr><td>账期边界用量归属错</td><td>以 occurred_at 而非入账时间划账期</td></tr>
+</tbody>
+</table>
+
+<h2 id="i13">I.13 统一管道在五种形态下的退化</h2>
+
+<p>同一条六段管道，末端按形态适配，<strong>段的语义不变、只换实现</strong>：</p>
+
+<table>
+<thead><tr><th>段</th><th>公有云</th><th>私有云在线</th><th>半离线</th><th>U盘气隙</th><th>纯许可</th></tr></thead>
+<tbody>
+<tr><td>①计量</td><td>SDK/Sidecar</td><td>同左</td><td>同左</td><td>同左</td><td>同左</td></tr>
+<tr><td>②归一</td><td colspan="5" style="text-align:center">完全相同（纯函数）</td></tr>
+<tr><td>③计价</td><td>DB 价目表</td><td>中心下发表</td><td>License 内嵌</td><td>License 内嵌</td><td>License 内嵌</td></tr>
+<tr><td>④计费</td><td>Redis+PG</td><td>Redis+PG</td><td>WAL</td><td>WAL+TPM</td><td>WAL+TPM</td></tr>
+<tr><td>⑤结算</td><td>实时出账</td><td>周期上报出账</td><td>Bundle 出账</td><td>导入后出账</td><td>不出账</td></tr>
+<tr><td>⑥对账</td><td>流+批对账</td><td>周期对账</td><td>周期对账</td><td>Merkle 对账</td><td>客户单方</td></tr>
+</tbody>
+</table>
+
+<p>②归一、③计价的核心逻辑完全相同——这正是"统一计量计费"落地的硬指标：<strong>同一笔用量，在任何形态下归一出同样的 SMU、计价出同样的点数</strong>，差异只在数据存哪、报给谁。</p>
+
+<h2 id="i14">I.14 一句话总结</h2>
+
+<p>统一计量计费的本质是<strong>"一个事件模型、一条管道、一个计价引擎"</strong>：所有产线的异构用量归一成同一个 UsageEvent，流经同一条"计量→归一→计价→计费→结算→对账"六段管道，由同一个纯函数计价引擎折算成点数。公私云、在线离线只在管道末端换实现，语义恒定——于是任意来源、任意形态的用量都能算得一致、对得上账、合得了并。</p>
+
+</main>
+<script>
+(function () {
+  var container = document.querySelector('.container');
+  var headings = container.querySelectorAll('h1, h2');
+  if (headings.length < 3) return;
+  var toc = document.createElement('nav');
+  toc.className = 'toc';
+  var title = document.createElement('div');
+  title.className = 'toc-title';
+  title.textContent = '目录';
+  toc.appendChild(title);
+  var rootList = document.createElement('ul');
+  toc.appendChild(rootList);
+  var currentH1Item = null;
+  var currentH2List = null;
+  headings.forEach(function (h, i) {
+    if (!h.id) h.id = 'h-' + i;
+    var item = document.createElement('li');
+    var link = document.createElement('a');
+    link.href = '#' + h.id;
+    link.textContent = h.textContent;
+    item.appendChild(link);
+    if (h.tagName === 'H1') {
+      rootList.appendChild(item);
+      currentH1Item = item;
+      currentH2List = null;
+    } else {
+      if (!currentH1Item) {
+        rootList.appendChild(item);
+      } else {
+        if (!currentH2List) {
+          currentH2List = document.createElement('ul');
+          currentH1Item.appendChild(currentH2List);
+        }
+        currentH2List.appendChild(item);
+      }
+    }
+  });
+  var firstH = container.querySelector('h1');
+  if (firstH && firstH.nextSibling) {
+    firstH.parentNode.insertBefore(toc, firstH.nextSibling);
+  } else {
+    container.insertBefore(toc, container.firstChild);
+  }
+})();
+</script>
+</body>
+</html>
